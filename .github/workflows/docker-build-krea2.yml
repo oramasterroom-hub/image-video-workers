@@ -37,7 +37,15 @@ env:
   #   그리고 안 쓰는 폴백 다운로드를 없앴다 — Raw GGUF 12.76GiB 를 매번 받고
   #   한 번도 안 썼다. 콜드스타트에서 25초를 버리고 있었다.
   #   ⚠️ v4 는 그대로 둔다. Krea2-Raw-TurboLoRA 엔드포인트가 v4 를 보고 있다.
-  IMAGE_TAG: v5
+  # v6 (2026-08-05): 첫 Krea Turbo 실행 실패 두 건 수정.
+  #   ① 파일 경로 — realrebelai 는 TURBO/ 하위폴더를 써서 파일이
+  #      models/unet/TURBO/ 로 들어갔는데 워크플로엔 파일명만 적어 ComfyUI 가 거부했다.
+  #      Value not in list: _Krea-2-Turbo-Q8_0.gguf_ not in [_TURBO/Krea-2-Turbo-Q8_0.gguf_]
+  #      → 저장소 구조와 무관하게 우리가 정한 폴더에 파일명만으로 놓는다.
+  #   ② LoRA 끄기 — 런포드가 빈 문자열/공백 환경변수를 컨테이너에 안 넣는다.
+  #      LORA_FILE=" " 로 우회했는데 실패해서 기본값(Turbo LoRA)이 되살아났다.
+  #      → none / off / - 같은 명시적 값으로 끈다.
+  IMAGE_TAG: v6
 
 jobs:
   build:

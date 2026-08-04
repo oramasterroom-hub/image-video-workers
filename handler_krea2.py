@@ -71,11 +71,14 @@ TE_FILE = os.environ.get(
 VAE_REPO = os.environ.get("VAE_REPO", COMFY_REPO).strip()
 VAE_FILE = os.environ.get("VAE_FILE", "vae/qwen_image_vae.safetensors").strip()
 
-# 비어 있으면 LoRA 를 안 쓴다
+# ⚠️ LoRA 를 끄려면 LORA_FILE 에 none / off / - 중 하나를 넣는다.
+#    2026-08-05: 빈 문자열이나 공백은 쓰면 안 된다.
+#    런포드가 빈 값을 버려서 handler 의 기본값(Turbo LoRA)이 되살아난다.
+#    API 로 조회하면 " " 가 저장돼 보이는데도 컨테이너에는 안 들어온다. 실제로 당했다.
 LORA_REPO = os.environ.get("LORA_REPO", COMFY_REPO).strip()
 LORA_FILE = os.environ.get(
     "LORA_FILE", "loras/krea2_turbo_lora_rank_64_bf16.safetensors").strip()
-USE_LORA = bool(LORA_FILE)
+USE_LORA = LORA_FILE.lower() not in ("", "none", "off", "-", "0", "false")
 
 # ⭐ 보스가 정한 값 (2026-08-04). 원출처는 Civitai 실사 워크플로 krea2_simple_v1.
 #    ⚠️ Turbo 단독으로 쓸 때는 STEPS=8 로 내려야 한다 (Krea 공식 권장).
@@ -103,50 +106,70 @@ def log(msg):
 # 1) 모델 받기
 # ──────────────────────────────────────────────────────────────────────
 
-def _model_dir():
-    """본체를 어느 폴더에 놓을지. ComfyUI 가 로더별로 다른 폴더를 본다.
+def _model_folder():
+    """본체가 들어갈 ComfyUI 폴더 이름. 로더마다 보는 곳이 다르다.
 
     gguf  → models/unet/               UnetLoaderGGUF 가 여기를 본다
     fp8   → models/diffusion_models/   UNETLoader 가 여기를 본다
     """
-    return f"{MODELS_DIR}/unet" if MODEL_BACKEND == "gguf" else MODELS_DIR
+    return "unet" if MODEL_BACKEND == "gguf" else "diffusion_models"
 
 
 def _plan_downloads():
-    """(repo_id, 저장소안 경로, 내려받을 폴더) 목록을 만든다.
+    """(repo_id, 저장소안 경로, ComfyUI 폴더 이름) 목록을 만든다.
 
-    ⭐ Comfy-Org/Krea-2 저장소의 폴더 구조가 ComfyUI models/ 구조와 똑같다.
-       그래서 local_dir=/comfyui/models 로 받으면 알아서 제자리에 놓인다.
-       ⚠️ 다른 저장소(예: realrebelai GGUF)는 그 구조가 아니라서
-          _model_dir() 로 목적지를 따로 정해준다.
+    ⚠️ 2026-08-05 실패로 배운 것 — 목적지를 명시해야 한다.
+       예전에는 local_dir=/comfyui/models 로 받아서 저장소의 폴더 구조를 그대로 썼다.
+       Comfy-Org/Krea-2 는 폴더 이름이 마침 ComfyUI 와 같아서(vae/ loras/) 잘 됐는데,
+       realrebelai 는 TURBO/ 라는 자기 폴더를 써서 파일이
+       models/unet/TURBO/Krea-2-Turbo-Q8_0.gguf 로 들어갔다.
+       그런데 워크플로에는 파일명만 적어서 ComfyUI 가 거부했다:
+         Value not in list: 'Krea-2-Turbo-Q8_0.gguf'
+                     not in ['TURBO/Krea-2-Turbo-Q8_0.gguf']
+       → 이제 저장소 구조와 무관하게 우리가 정한 폴더에 파일명만으로 놓는다.
 
-    ⚠️ 2026-08-05: 안 쓰는 폴백을 받던 것을 없앴다.
-       Raw GGUF 12.76GiB 를 매번 받고 한 번도 안 썼다. 콜드스타트에서 25초를 버렸다.
-       이제 부품을 전부 환경변수로 정하므로, 갈아탈 때는 템플릿 값만 바꾸면 된다.
+    ⚠️ 안 쓰는 폴백은 받지 않는다. 예전에 Raw GGUF 12.76GiB 를 매번 받고
+       한 번도 안 썼다. 부품이 환경변수라 갈아탈 때 템플릿만 바꾸면 된다.
     """
     jobs = [
-        (MODEL_REPO, MODEL_FILE, _model_dir()),
-        (TE_REPO, TE_FILE, MODELS_DIR),
-        (VAE_REPO, VAE_FILE, MODELS_DIR),
+        (MODEL_REPO, MODEL_FILE, _model_folder()),
+        (TE_REPO, TE_FILE, "text_encoders"),
+        (VAE_REPO, VAE_FILE, "vae"),
     ]
     if USE_LORA:
-        jobs.append((LORA_REPO, LORA_FILE, MODELS_DIR))
+        jobs.append((LORA_REPO, LORA_FILE, "loras"))
     return jobs
 
 
-def _download_one(repo_id, filename, local_dir):
+def _download_one(repo_id, filename, comfy_folder):
+    """받아서 /comfyui/models/<comfy_folder>/<파일명> 에 놓는다.
+
+    ⚠️ 저장소가 어떤 폴더 구조를 쓰든 여기서 평평하게 만든다.
+       그래야 워크플로에서 파일명만으로 가리킬 수 있다.
+    """
     t0 = time.time()
+    dest_dir = os.path.join(MODELS_DIR, comfy_folder)
+    os.makedirs(dest_dir, exist_ok=True)
+
     path = hf_hub_download(
         repo_id=repo_id,
         filename=filename,
-        local_dir=local_dir,
+        local_dir=dest_dir,
         token=HF_TOKEN,
     )
+
+    # 저장소 안에 하위 폴더가 있었으면 파일이 그만큼 깊이 들어간다. 끌어올린다.
+    want = os.path.join(dest_dir, os.path.basename(filename))
+    if os.path.abspath(path) != os.path.abspath(want):
+        os.replace(path, want)
+        log(f"[download] 위치 정리: {path} → {want}")
+        path = want
+
     size = os.path.getsize(path)
     sec = time.time() - t0
     speed = (size / 1024**2) / sec if sec > 0 else 0
-    log(f"[download] {repo_id}/{filename}  {size / 1024**3:.2f} GiB  "
-        f"{sec:.1f}초  ({speed:.0f} MB/s)")
+    log(f"[download] {repo_id}/{filename}  →  {comfy_folder}/{os.path.basename(filename)}  "
+        f"{size / 1024**3:.2f} GiB  {sec:.1f}초  ({speed:.0f} MB/s)")
     return size
 
 
@@ -154,7 +177,7 @@ def download_models():
     jobs = _plan_downloads()
     log(f"[download] {len(jobs)}개 파일 받기 시작 "
         f"(backend={MODEL_BACKEND}, model={MODEL_FILE}, "
-        f"lora={LORA_FILE or '없음'}, steps={DEFAULT_STEPS})")
+        f"lora={LORA_FILE if USE_LORA else '없음'}, steps={DEFAULT_STEPS})")
 
     t0 = time.time()
     total = 0
