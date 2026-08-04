@@ -35,26 +35,52 @@ MODELS_DIR = "/comfyui/models"
 
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_ACCESS_TOKEN")
 
-# 1안(fp8) / 폴백(gguf) 전환. 재빌드 없이 환경변수로 바꾼다.
-MODEL_BACKEND = os.environ.get("MODEL_BACKEND", "fp8").strip().lower()
-# 텍스트 인코더 bf16 / fp8 전환. 24GB 에 안 들어가면 fp8 로 내린다.
-TE_VARIANT = os.environ.get("TE_VARIANT", "bf16").strip().lower()
-# 폴백 부품도 같이 받아둘지. 받는 건 공짜라 기본 켬 (보스 지시 2026-08-04)
-DOWNLOAD_FALLBACKS = os.environ.get("DOWNLOAD_FALLBACKS", "1") != "0"
-
+# ──────────────────────────────────────────────────────────────────────
+# ⭐ 부품을 전부 환경변수로 뺐다 (2026-08-05)
+#
+# 이전 판은 파일 이름이 코드에 박혀 있어서, 다른 모델을 시험하려면 매번
+# 재빌드를 해야 했다. 이제 템플릿 환경변수만 바꾸면 어떤 조합이든 돌아간다.
+#
+# MODEL_BACKEND 가 하는 일은 "어느 ComfyUI 로더를 쓰고 어느 폴더에 놓느냐" 뿐이다.
+#   fp8   → UNETLoader        / models/diffusion_models/   ComfyUI 기본 노드
+#   gguf  → UnetLoaderGGUF    / models/unet/               molbal 커스텀 노드 필요
+#
+# LORA_FILE 이 비어 있으면 LoRA 를 아예 안 얹는다.
+#   ⚠️ Turbo 체크포인트에는 증류가 이미 들어 있으므로 LoRA 를 얹으면 안 된다.
+#
+# 설정 예시
+#   Raw + Turbo LoRA (기존)
+#     MODEL_FILE=diffusion_models/krea2_raw_fp8_scaled.safetensors
+#     LORA_FILE=loras/krea2_turbo_lora_rank_64_bf16.safetensors  LORA_STRENGTH=0.6  STEPS=12
+#   Turbo 단독 Q8
+#     MODEL_REPO=realrebelai/KREA-2_GGUFs
+#     MODEL_FILE=TURBO/Krea-2-Turbo-Q8_0.gguf   MODEL_BACKEND=gguf
+#     LORA_FILE=(비움)                          STEPS=8
+# ──────────────────────────────────────────────────────────────────────
 COMFY_REPO = "Comfy-Org/Krea-2"
-GGUF_REPO = "vantagewithai/Krea-2-Raw-GGUF"
 
-FILE_FP8_MODEL = "diffusion_models/krea2_raw_fp8_scaled.safetensors"
-FILE_TE_BF16 = "text_encoders/qwen3vl_4b_bf16.safetensors"
-FILE_TE_FP8 = "text_encoders/qwen3vl_4b_fp8_scaled.safetensors"
-FILE_VAE = "vae/qwen_image_vae.safetensors"
-FILE_LORA = "loras/krea2_turbo_lora_rank_64_bf16.safetensors"
-FILE_GGUF_MODEL = "krea2_raw-Q8_0.gguf"
+MODEL_BACKEND = os.environ.get("MODEL_BACKEND", "fp8").strip().lower()
+MODEL_REPO = os.environ.get("MODEL_REPO", COMFY_REPO).strip()
+MODEL_FILE = os.environ.get(
+    "MODEL_FILE", "diffusion_models/krea2_raw_fp8_scaled.safetensors").strip()
+
+TE_REPO = os.environ.get("TE_REPO", COMFY_REPO).strip()
+TE_FILE = os.environ.get(
+    "TE_FILE", "text_encoders/qwen3vl_4b_bf16.safetensors").strip()
+
+VAE_REPO = os.environ.get("VAE_REPO", COMFY_REPO).strip()
+VAE_FILE = os.environ.get("VAE_FILE", "vae/qwen_image_vae.safetensors").strip()
+
+# 비어 있으면 LoRA 를 안 쓴다
+LORA_REPO = os.environ.get("LORA_REPO", COMFY_REPO).strip()
+LORA_FILE = os.environ.get(
+    "LORA_FILE", "loras/krea2_turbo_lora_rank_64_bf16.safetensors").strip()
+USE_LORA = bool(LORA_FILE)
 
 # ⭐ 보스가 정한 값 (2026-08-04). 원출처는 Civitai 실사 워크플로 krea2_simple_v1.
-DEFAULT_LORA_STRENGTH = 0.6
-DEFAULT_STEPS = 12
+#    ⚠️ Turbo 단독으로 쓸 때는 STEPS=8 로 내려야 한다 (Krea 공식 권장).
+DEFAULT_LORA_STRENGTH = float(os.environ.get("LORA_STRENGTH", "0.6"))
+DEFAULT_STEPS = int(os.environ.get("STEPS", "12"))
 # CFG 1.0 = 네거티브가 작동하지 않는다. 1 을 넘기면 생성 시간이 2배가 된다.
 DEFAULT_CFG = 1.0
 DEFAULT_SAMPLER = "euler"
@@ -77,34 +103,34 @@ def log(msg):
 # 1) 모델 받기
 # ──────────────────────────────────────────────────────────────────────
 
+def _model_dir():
+    """본체를 어느 폴더에 놓을지. ComfyUI 가 로더별로 다른 폴더를 본다.
+
+    gguf  → models/unet/               UnetLoaderGGUF 가 여기를 본다
+    fp8   → models/diffusion_models/   UNETLoader 가 여기를 본다
+    """
+    return f"{MODELS_DIR}/unet" if MODEL_BACKEND == "gguf" else MODELS_DIR
+
+
 def _plan_downloads():
     """(repo_id, 저장소안 경로, 내려받을 폴더) 목록을 만든다.
 
     ⭐ Comfy-Org/Krea-2 저장소의 폴더 구조가 ComfyUI models/ 구조와 똑같다.
        그래서 local_dir=/comfyui/models 로 받으면 알아서 제자리에 놓인다.
+       ⚠️ 다른 저장소(예: realrebelai GGUF)는 그 구조가 아니라서
+          _model_dir() 로 목적지를 따로 정해준다.
+
+    ⚠️ 2026-08-05: 안 쓰는 폴백을 받던 것을 없앴다.
+       Raw GGUF 12.76GiB 를 매번 받고 한 번도 안 썼다. 콜드스타트에서 25초를 버렸다.
+       이제 부품을 전부 환경변수로 정하므로, 갈아탈 때는 템플릿 값만 바꾸면 된다.
     """
     jobs = [
-        (COMFY_REPO, FILE_VAE, MODELS_DIR),
-        (COMFY_REPO, FILE_LORA, MODELS_DIR),
+        (MODEL_REPO, MODEL_FILE, _model_dir()),
+        (TE_REPO, TE_FILE, MODELS_DIR),
+        (VAE_REPO, VAE_FILE, MODELS_DIR),
     ]
-
-    # 본체
-    if MODEL_BACKEND == "gguf":
-        jobs.append((GGUF_REPO, FILE_GGUF_MODEL, f"{MODELS_DIR}/unet"))
-    else:
-        jobs.append((COMFY_REPO, FILE_FP8_MODEL, MODELS_DIR))
-
-    # 텍스트 인코더
-    jobs.append((COMFY_REPO, FILE_TE_FP8 if TE_VARIANT == "fp8" else FILE_TE_BF16, MODELS_DIR))
-
-    # 폴백도 같이 받아둔다. 갈아탈 때 재빌드도 재다운로드도 안 하기 위해서다.
-    if DOWNLOAD_FALLBACKS:
-        if MODEL_BACKEND == "gguf":
-            jobs.append((COMFY_REPO, FILE_FP8_MODEL, MODELS_DIR))
-        else:
-            jobs.append((GGUF_REPO, FILE_GGUF_MODEL, f"{MODELS_DIR}/unet"))
-        jobs.append((COMFY_REPO, FILE_TE_BF16 if TE_VARIANT == "fp8" else FILE_TE_FP8, MODELS_DIR))
-
+    if USE_LORA:
+        jobs.append((LORA_REPO, LORA_FILE, MODELS_DIR))
     return jobs
 
 
@@ -127,7 +153,8 @@ def _download_one(repo_id, filename, local_dir):
 def download_models():
     jobs = _plan_downloads()
     log(f"[download] {len(jobs)}개 파일 받기 시작 "
-        f"(backend={MODEL_BACKEND}, te={TE_VARIANT}, fallbacks={DOWNLOAD_FALLBACKS})")
+        f"(backend={MODEL_BACKEND}, model={MODEL_FILE}, "
+        f"lora={LORA_FILE or '없음'}, steps={DEFAULT_STEPS})")
 
     t0 = time.time()
     total = 0
@@ -250,39 +277,41 @@ class VramWatcher(threading.Thread):
 # ──────────────────────────────────────────────────────────────────────
 
 def build_workflow(prompt, negative, width, height, steps, cfg, seed,
-                   lora_strength, sampler, scheduler, backend, te_variant):
+                   lora_strength, sampler, scheduler, backend):
     """ComfyUI API 형식 워크플로를 만든다.
 
     노드 구성은 ComfyUI 공식 템플릿(image_krea2_turbo_t2i.json)에서 확인한 것과 같다:
-      UNETLoader → LoraLoaderModelOnly → KSampler → VAEDecode → SaveImage
+      UNETLoader → (LoraLoaderModelOnly) → KSampler → VAEDecode → SaveImage
       CLIPLoader(type=krea2) → CLIPTextEncode → (ConditioningZeroOut)
       VAELoader / EmptyLatentImage
+
+    ⚠️ LoRA 노드는 LORA_FILE 이 있을 때만 끼운다.
+       Turbo 체크포인트는 증류가 이미 들어 있어서 LoRA 를 얹으면 안 된다.
     """
     if backend == "gguf":
-        # ⚠️ 폴백 경로. molbal 커스텀 노드가 있어야 동작한다.
+        # ⚠️ molbal 커스텀 노드가 있어야 동작한다. 이 파일은 models/unet/ 에 있다.
         loader = {
             "class_type": "UnetLoaderGGUF",
-            "inputs": {"unet_name": FILE_GGUF_MODEL},
+            "inputs": {"unet_name": os.path.basename(MODEL_FILE)},
         }
     else:
         loader = {
             "class_type": "UNETLoader",
             "inputs": {
-                "unet_name": os.path.basename(FILE_FP8_MODEL),
-                # ⚠️ "default" 여야 한다. 이 파일은 배율값(weight_scale)을 자기가 들고 있어서
-                #    ComfyUI 가 알아서 처리한다. 여기서 fp8_e4m3fn 을 고르면 이중으로 깎인다.
+                "unet_name": os.path.basename(MODEL_FILE),
+                # ⚠️ "default" 여야 한다. fp8_scaled 파일은 배율값(weight_scale)을
+                #    자기가 들고 있어서 ComfyUI 가 알아서 처리한다.
+                #    여기서 fp8_e4m3fn 을 고르면 이중으로 깎인다.
                 "weight_dtype": "default",
             },
         }
-
-    te_file = FILE_TE_FP8 if te_variant == "fp8" else FILE_TE_BF16
 
     wf = {
         "1": loader,
         "2": {
             "class_type": "CLIPLoader",
             "inputs": {
-                "clip_name": os.path.basename(te_file),
+                "clip_name": os.path.basename(TE_FILE),
                 # ⭐ 반드시 krea2. 이게 있어야 12층 추출이 발동한다.
                 #    잘못되면 조건값 크기가 30720 이 아니라 2560 으로 나온다.
                 "type": "krea2",
@@ -291,15 +320,7 @@ def build_workflow(prompt, negative, width, height, steps, cfg, seed,
         },
         "3": {
             "class_type": "VAELoader",
-            "inputs": {"vae_name": os.path.basename(FILE_VAE)},
-        },
-        "4": {
-            "class_type": "LoraLoaderModelOnly",
-            "inputs": {
-                "model": ["1", 0],
-                "lora_name": os.path.basename(FILE_LORA),
-                "strength_model": lora_strength,
-            },
+            "inputs": {"vae_name": os.path.basename(VAE_FILE)},
         },
         "5": {
             "class_type": "CLIPTextEncode",
@@ -312,7 +333,8 @@ def build_workflow(prompt, negative, width, height, steps, cfg, seed,
         "8": {
             "class_type": "KSampler",
             "inputs": {
-                "model": ["4", 0],
+                # LoRA 를 쓰면 "4"(LoRA 노드), 안 쓰면 "1"(본체)에서 바로 받는다
+                "model": ["4" if USE_LORA else "1", 0],
                 "positive": ["5", 0],
                 "negative": ["6", 0],
                 "latent_image": ["7", 0],
@@ -333,6 +355,17 @@ def build_workflow(prompt, negative, width, height, steps, cfg, seed,
             "inputs": {"images": ["9", 0], "filename_prefix": "krea2"},
         },
     }
+
+    # LoRA 는 쓸 때만 노드를 끼운다
+    if USE_LORA:
+        wf["4"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["1", 0],
+                "lora_name": os.path.basename(LORA_FILE),
+                "strength_model": lora_strength,
+            },
+        }
 
     # ⚠️ CFG 가 1.0 이면 네거티브가 계산에 안 들어간다. 빈 조건을 넣는 게 정석이다.
     #    괜히 글을 넣으면 인코딩 시간만 쓰고 결과에는 아무 영향이 없다.
@@ -418,14 +451,15 @@ def handler(event):
     lora_strength = float(job.get("lora_strength", DEFAULT_LORA_STRENGTH))
     sampler = str(job.get("sampler", DEFAULT_SAMPLER))
     scheduler = str(job.get("scheduler", DEFAULT_SCHEDULER))
-    backend = str(job.get("backend", MODEL_BACKEND)).lower()
-    te_variant = str(job.get("te_variant", TE_VARIANT)).lower()
+    # ⚠️ backend 는 요청마다 못 바꾼다. 받아둔 파일이 그 하나뿐이기 때문이다.
+    #    바꾸려면 템플릿 환경변수(MODEL_BACKEND / MODEL_FILE)를 고쳐야 한다.
+    backend = MODEL_BACKEND
 
     seed = job.get("seed", DEFAULT_SEED)
     seed = random.randint(0, 2**31 - 1) if seed in (None, -1, "random") else int(seed)
 
     wf = build_workflow(str(prompt), str(negative), width, height, steps, cfg,
-                        seed, lora_strength, sampler, scheduler, backend, te_variant)
+                        seed, lora_strength, sampler, scheduler, backend)
 
     watcher = VramWatcher()
     watcher.start()
@@ -460,14 +494,13 @@ def handler(event):
         "seed": seed,
         "steps": steps,
         "cfg": cfg,
-        "lora_strength": lora_strength,
+        "lora_strength": lora_strength if USE_LORA else None,
         "sampler": sampler,
         "scheduler": scheduler,
         "backend": backend,
-        "model": (f"{GGUF_REPO}/{FILE_GGUF_MODEL}" if backend == "gguf"
-                  else f"{COMFY_REPO}/{FILE_FP8_MODEL}"),
-        "text_encoder": f"{COMFY_REPO}/{FILE_TE_FP8 if te_variant == 'fp8' else FILE_TE_BF16}",
-        "lora": f"{COMFY_REPO}/{FILE_LORA}",
+        "model": f"{MODEL_REPO}/{MODEL_FILE}",
+        "text_encoder": f"{TE_REPO}/{TE_FILE}",
+        "lora": f"{LORA_REPO}/{LORA_FILE}" if USE_LORA else None,
         "negative_prompt_used": bool(negative) and cfg > 1.0,
         "generation_sec": round(elapsed, 1),
         "filename": filename,

@@ -30,7 +30,14 @@ env:
   #   v2·v3 실패가 전부 이 줄 하나에서 났다. 정작 워커는 v2 부터 멀쩡했다.
   #   ComfyUI 를 v0.29.2 로 고정했고 그 태그 소스에서 CLIPType.KREA2 = 32 를
   #   이미 확인했다. 안 변하는 것을 빌드마다 다시 확인할 이유가 없었다.
-  IMAGE_TAG: v4
+  # v5 (2026-08-05): 부품을 전부 환경변수로 뺐다.
+  #   MODEL_REPO/MODEL_FILE/TE_*/VAE_*/LORA_*/LORA_STRENGTH/STEPS
+  #   → 앞으로는 재빌드 없이 템플릿 값만 바꿔 어떤 조합이든 시험할 수 있다.
+  #   LORA_FILE 이 비면 LoRA 노드를 아예 안 끼운다 (Turbo 체크포인트용).
+  #   그리고 안 쓰는 폴백 다운로드를 없앴다 — Raw GGUF 12.76GiB 를 매번 받고
+  #   한 번도 안 썼다. 콜드스타트에서 25초를 버리고 있었다.
+  #   ⚠️ v4 는 그대로 둔다. Krea2-Raw-TurboLoRA 엔드포인트가 v4 를 보고 있다.
+  IMAGE_TAG: v5
 
 jobs:
   build:
