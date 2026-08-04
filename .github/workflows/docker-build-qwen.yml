@@ -1,0 +1,67 @@
+name: Build Qwen-Image-2512 RunPod worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.qwen"
+      - "handler_qwen.py"
+      - ".github/workflows/docker-build-qwen.yml"
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: qwen-runpod
+  # 런포드는 이름표가 같으면 자기 기계에 캐시해둔 옛 이미지를 계속 쓴다.
+  # handler/Dockerfile 을 고칠 때마다 이름표를 올린다.
+  IMAGE_TAG: v1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 파이토치 베이스 이미지가 커서 러너 디스크가 모자랄 수 있다.
+      # 안 쓰는 것들을 먼저 지워 공간을 확보한다.
+      - name: 디스크 공간 확보
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 빌드 후 ghcr.io 로 푸시
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.qwen
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          provenance: false
+
+  # 같은 태그로 덮어쓰면 옛 이미지가 태그 없이 남아 매번 쌓인다.
+  cleanup:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: 태그 없는 옛 이미지 삭제
+        uses: actions/delete-package-versions@v5
+        continue-on-error: true
+        with:
+          package-name: qwen-runpod
+          package-type: container
+          min-versions-to-keep: 1
+          delete-only-untagged-versions: true
