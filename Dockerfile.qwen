@@ -26,7 +26,8 @@ WORKDIR /app
 # 0.39.0(2026-07-03 릴리스)에 들어 있는 것을 확인했다. 버전을 고정할 수 있어야 안전하다.
 #
 # gguf        GGUF 파일을 읽는 데 필요
-# hf_transfer 38.6GB 를 빨리 받기 위해 필요
+# hf_xet     ⭐ 대용량 다운로드 가속. 이게 실제로 일하는 물건이다 (초당 1,463MB 실측)
+# hf_transfer 폐기됨. 아무 일도 안 하지만 옛 경로 대비로 남겨둔다
 # peft        ⭐ LoRA 를 얹는 데 필요 (2026-08-04 v4 에서 이게 없어서 워커가 죽었다)
 #             diffusers 의 load_lora_weights() 는 첫 줄에서 USE_PEFT_BACKEND 를 확인하고
 #             없으면 ValueError("PEFT backend is required for this method.") 로 거부한다.
@@ -40,6 +41,7 @@ RUN python -m pip install --no-cache-dir --break-system-packages \
       protobuf \
       pillow \
       gguf \
+      hf_xet \
       hf_transfer \
       runpod \
       peft
@@ -50,6 +52,7 @@ RUN python -c "import sys; print('python:', sys.executable)" && \
     python -c "import torch; a=torch.cuda.get_arch_list(); print('arch list:', a); assert any('120' in x for x in a), 'sm_120(블랙웰) 미지원 파이토치다'" && \
     python -c "from diffusers import QwenImagePipeline, QwenImageTransformer2DModel, GGUFQuantizationConfig; print('QwenImage + GGUF import OK')" && \
     python -c "import peft; print('peft:', peft.__version__)" && \
+    python -c "import hf_xet; print('hf_xet OK — Xet 고속 전송 사용 가능')" && \
     python -c "from diffusers.utils import USE_PEFT_BACKEND; print('USE_PEFT_BACKEND =', USE_PEFT_BACKEND); assert USE_PEFT_BACKEND, 'peft 백엔드가 꺼져 있다. load_lora_weights 가 거부한다'" && \
     python -c "import gguf, hf_transfer; print('gguf/hf_transfer OK')" && \
     python -c "import runpod, transformers, accelerate; print('runpod/transformers/accelerate OK')"

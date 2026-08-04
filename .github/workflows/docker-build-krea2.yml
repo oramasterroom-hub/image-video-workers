@@ -72,8 +72,11 @@ jobs:
           IMG=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           docker pull "$IMG"
           echo "=============================================="
-          docker image inspect "$IMG" --format '압축 해제 크기: {{.Size}} 바이트'
-          docker image inspect "$IMG" --format '압축 해제 크기: {{div .Size 1048576}} MB'
+          # ⚠️ 고 템플릿에는 div 함수가 없다. 여기서 계산하지 말고 셸에서 나눈다
+          #    (2026-08-04 v4 빌드에서 이 줄 때문에 스텝이 실패했다.
+          #     이미지는 이미 빌드·푸시가 끝난 뒤였다)
+          BYTES=$(docker image inspect "$IMG" --format '{{.Size}}')
+          echo "압축 해제 크기: $BYTES 바이트 ($((BYTES / 1048576)) MB)"
           echo "=============================================="
 
   # 같은 태그로 덮어쓰면 옛 이미지가 태그 없이 남아 매번 쌓인다.

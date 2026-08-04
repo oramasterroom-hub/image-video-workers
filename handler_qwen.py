@@ -30,6 +30,16 @@ import traceback
 print(f"[init] python: {sys.executable}", flush=True)
 
 # 허깅페이스에서 받는 속도를 올린다. 38.6GB 를 받아야 해서 켠다.
+#
+# ⚠️ 2026-08-04 빌드 로그에서 발견: HF_HUB_ENABLE_HF_TRANSFER 는 더 이상 아무 일도 안 한다.
+#    huggingface_hub 경고 원문:
+#      "deprecated as 'hf_transfer' is not used anymore.
+#       Please use HF_XET_HIGH_PERFORMANCE instead"
+#    실측 차이가 크다:
+#      Krea 워커(hf_xet 적용)  38.83 GiB / 27.2초 = 초당 1,463 MB
+#      Qwen 워커(미적용)       21.76 GB  / 30~64초 = 초당 340~725 MB
+#    → 둘 다 켠다. 옛 판이든 새 판이든 빠른 길로 가고 경고도 안 뜬다.
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 # 메모리 파편화 대응. 여유가 3GiB 대로 빠듯해서 반드시 필요하다.
@@ -200,38 +210,8 @@ try:
     #    그건 LoRA 가 입력 채널 수를 바꾸는 특수한 경우에만 불린다.
     #    평범한 증류 LoRA 는 그 경우가 아니라 이 함수를 안 탄다.
     #    (통째로 풀렸다면 Q8 21GB 가 bf16 40GB 로 부풀어 24GB 를 넘겼을 것이다)
-    if TURBO:
-        _t2 = time.time()
-        print(f"[init] 터보 켜짐 — LoRA 받는 중: {LORA_REPO}/{LORA_FILE}", flush=True)
-        lora_path = hf_hub_download(repo_id=LORA_REPO, filename=LORA_FILE)
-
-        PIPE.scheduler = FlowMatchEulerDiscreteScheduler.from_config({
-            "base_image_seq_len": 256,
-            "base_shift": math.log(3),   # 증류에 shift=3 을 썼다
-            "invert_sigmas": False,
-            "max_image_seq_len": 8192,
-            "max_shift": math.log(3),
-            "num_train_timesteps": 1000,
-            "shift": 1.0,
-            "shift_terminal": None,
-            "stochastic_sampling": False,
-            "time_shift_type": "exponential",
-            "use_beta_sigmas": False,
-            "use_dynamic_shifting": True,
-            "use_exponential_sigmas": False,
-            "use_karras_sigmas": False,
-        })
-        print("[init] 스케줄러 교체 완료 (shift=3 계열)", flush=True)
-
-        # ⚠️ fuse 하지 않는다. fuse 하면 GGUF 를 풀어서 원본 가중치에 합치는데
-        #    그러면 24GB 를 넘긴다. 얹어만 두고 생성할 때마다 더하는 방식으로 쓴다.
-        PIPE.load_lora_weights(lora_path)
-        print(f"[init] LoRA 적용 완료 ({time.time() - _t2:.0f}초) "
-              f"scale={LORA_SCALE} / {DEFAULT_STEPS}스텝 / CFG {DEFAULT_TRUE_CFG}",
-              flush=True)
-    else:
-        print(f"[init] 터보 꺼짐 — 원래대로 {DEFAULT_STEPS}스텝 / "
-              f"CFG {DEFAULT_TRUE_CFG}", flush=True)
+    # ⚠️ 터보 LoRA 는 여기서 얹지 않는다. GPU 배치가 끝난 "다음"에 얹는다. ⑤-2 참조.
+    #    (2026-08-04: 공식 예제 순서대로 여기 뒀더니 CPU 메모리가 93% 까지 올라갔다)
 
     # ⑤ ⭐ 메모리 전략
     #
@@ -271,6 +251,71 @@ try:
     #    항상 cuda 로 답하도록 고정한다.
     type(PIPE)._execution_device = property(lambda self: torch.device("cuda"))
     print(f"[init] 실행 장치 고정: {PIPE._execution_device}", flush=True)
+
+    # ⑤-2 ⭐ 터보 LoRA — 반드시 GPU 배치가 끝난 "다음"에 얹는다
+    #
+    # ⚠️ 2026-08-04 실측. 공식 예제(ModelTC/Qwen-Image-Lightning)는
+    #    파이프라인 조립 직후, GPU 로 옮기기 전에 LoRA 를 얹는다.
+    #    그 순서를 그대로 따랐더니 CPU 메모리가 43.68 / 46.57 GiB (93%) 까지 올라갔다.
+    #    공식 예제 환경은 GPU 가 커서 CPU 에 다 올려둬도 문제가 없지만
+    #    우리는 컨테이너 RAM 한도가 46.57 GiB 라 여유가 2.9 GiB 밖에 안 남았다.
+    #    → 트랜스포머를 GPU 로 먼저 보낸 뒤에 얹으면 CPU 는 글 읽는 부분(15.44 GiB)만 든다.
+    #
+    # ⚠️ GGUF 에 LoRA 를 얹어도 모델이 통째로 풀리지 않는다는 것을 소스로 확인했다.
+    #    diffusers 0.39.0 lora_pipeline.py 의 GGUF 해제 코드는
+    #    _maybe_dequantize_weight_for_expanded_lora() 안에 있는데,
+    #    그건 LoRA 가 입력 채널 수를 바꾸는 특수한 경우에만 불린다.
+    #    평범한 증류 LoRA 는 그 경우가 아니라 이 함수를 안 탄다.
+    #    (통째로 풀렸다면 Q8 21GB 가 bf16 40GB 로 부풀어 24GB 를 넘겼을 것이다)
+    #
+    # ⚠️ peft 가 반드시 깔려 있어야 한다. 없으면 load_lora_weights 가 첫 줄에서
+    #    ValueError("PEFT backend is required for this method.") 로 거부한다.
+    #    2026-08-04 에 이것 때문에 워커가 무한 재시작하며 140원을 태웠다.
+    if TURBO:
+        _t2 = time.time()
+        print(f"[init] 터보 켜짐 — LoRA 받는 중: {LORA_REPO}/{LORA_FILE}", flush=True)
+        lora_path = hf_hub_download(repo_id=LORA_REPO, filename=LORA_FILE)
+
+        # ⚠️ LoRA 만 얹고 스텝을 줄이면 안 된다. 스케줄러를 같이 갈아끼워야 한다.
+        #    증류할 때 shift=3 을 썼기 때문에 그 값에 맞춰야 8스텝이 제대로 나온다.
+        #    아래 값은 ModelTC/Qwen-Image-Lightning 의 코드 원문 그대로다.
+        PIPE.scheduler = FlowMatchEulerDiscreteScheduler.from_config({
+            "base_image_seq_len": 256,
+            "base_shift": math.log(3),   # 증류에 shift=3 을 썼다
+            "invert_sigmas": False,
+            "max_image_seq_len": 8192,
+            "max_shift": math.log(3),
+            "num_train_timesteps": 1000,
+            "shift": 1.0,
+            "shift_terminal": None,
+            "stochastic_sampling": False,
+            "time_shift_type": "exponential",
+            "use_beta_sigmas": False,
+            "use_dynamic_shifting": True,
+            "use_exponential_sigmas": False,
+            "use_karras_sigmas": False,
+        })
+        print("[init] 스케줄러 교체 완료 (shift=3 계열)", flush=True)
+
+        # ⚠️ fuse 하지 않는다. fuse 하면 GGUF 를 풀어서 원본 가중치에 합치는데
+        #    그러면 24GB 를 넘긴다. 얹어만 두고 생성할 때마다 더하는 방식으로 쓴다.
+        PIPE.load_lora_weights(lora_path, adapter_name="turbo")
+
+        # ⭐ 강도 적용. 2026-08-04 이전 판에서는 LORA_SCALE 을 읽어서 출력만 하고
+        #    실제로는 파이프라인에 넘기지 않았다. 그래서 강도를 바꿔볼 수가 없었다.
+        #    Krea 에서 통한 수(강도를 낮추고 스텝을 늘리는 것)를 여기서도 쓰려면 필요하다.
+        if LORA_SCALE != 1.0:
+            PIPE.set_adapters(["turbo"], adapter_weights=[LORA_SCALE])
+            print(f"[init] LoRA 강도 {LORA_SCALE} 적용", flush=True)
+
+        print(f"[init] LoRA 적용 완료 ({time.time() - _t2:.0f}초) "
+              f"scale={LORA_SCALE} / {DEFAULT_STEPS}스텝 / CFG {DEFAULT_TRUE_CFG}",
+              flush=True)
+        print(f"[init] LoRA 적용 후 GPU 점유: "
+              f"{torch.cuda.memory_allocated() / 1024**3:.2f} GiB", flush=True)
+    else:
+        print(f"[init] 터보 꺼짐 — 원래대로 {DEFAULT_STEPS}스텝 / "
+              f"CFG {DEFAULT_TRUE_CFG}", flush=True)
 
     # ⑥ 마지막 펼치는 단계를 조각내서 처리한다. 화질을 깎는 설정이 아니다.
     #    ⚠️ 2026-08-03 확인: 이 기능은 파이프라인이 아니라 VAE 쪽에 있다.

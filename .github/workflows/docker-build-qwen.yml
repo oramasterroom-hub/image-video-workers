@@ -30,7 +30,13 @@ env:
   #     ValueError: PEFT backend is required for this method.
   #   diffusers 의 load_lora_weights() 가 peft 를 요구하는데 안 깔려 있었다.
   #   빌드에서 USE_PEFT_BACKEND 를 직접 확인하도록 검사문도 추가했다.
-  IMAGE_TAG: v5
+  # v6 (2026-08-04): 워커 개선 3가지.
+  #   ① LoRA 를 GPU 배치 뒤로 옮김 — v5 는 CPU 메모리가 93%(43.68/46.57GiB)까지 올라갔다.
+  #      공식 예제 순서를 그대로 따른 게 원인. 그쪽은 GPU 가 커서 문제없지만 우리는 아니다.
+  #   ② hf_xet 추가 — HF_HUB_ENABLE_HF_TRANSFER 는 폐기돼 아무 일도 안 한다.
+  #      Krea 워커는 hf_xet 으로 초당 1,463MB, Qwen 은 미적용이라 340~725MB 였다.
+  #   ③ LORA_SCALE 을 실제로 적용 — v5 까지는 읽어서 출력만 하고 안 넘겼다.
+  IMAGE_TAG: v6
 
 jobs:
   build:
