@@ -21,7 +21,12 @@ env:
   #   pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime
   #   이 판은 GPU 없이도 ['sm_75'...'sm_120'] 을 제대로 찍는다(Qwen 빌드 로그로 확인).
   #   그리고 hf_transfer 가 더는 쓰이지 않는다는 것을 로그에서 확인해 hf_xet 으로 바꿈.
-  IMAGE_TAG: v2
+  # v3 (2026-08-04): Krea2 확인문이 GPU 없는 빌드 머신에서 죽던 것 수정.
+  #   comfy.sd 를 import 하면 model_management 가 즉시 CUDA 를 초기화한다.
+  #   --cpu 를 넘겨 cpu_state 를 CPU 로 만든 뒤 import 하도록 바꿈.
+  #   ⭐ v2 에서 통과한 것: torch 2.13.0+cu130 / arch list 에 sm_120 있음 /
+  #      huggingface_hub 0.36.2 + hf_xet OK / ComfyUI CPU 기동 + 커스텀 노드 로드
+  IMAGE_TAG: v3
 
 jobs:
   build:
