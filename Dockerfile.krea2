@@ -126,24 +126,14 @@ import hf_xet; print('hf_xet OK — Xet 고속 전송 사용 가능')"
 # ⭐ ComfyUI 를 실제로 한 번 띄워본다(CPU). 노드 그래프를 전부 import 하므로
 #    커스텀 노드가 깨졌거나 의존성이 어긋났으면 여기서 잡힌다.
 #    런타임에 "server not reachable" 로 나타나면 원인을 못 찾는다.
-# ⭐ 그리고 Krea2 지원이 이 ComfyUI 판에 실제로 들어 있는지 확인한다.
 #
-# ⚠️ 2026-08-04 2차 빌드 실패로 배운 것 — comfy.sd 를 그냥 import 하면 안 된다.
-#    comfy/model_management.py 는 362번 줄에서 임포트하자마자
-#      total_vram = get_total_memory(get_torch_device())
-#    를 실행하는데, 빌드 머신에는 GPU 가 없어서 "Found no NVIDIA driver" 로 죽는다.
-#    (앞서 cli_args 는 args_parsing=False 라 안전한 걸 확인했는데, 이건 놓쳤다)
-#
-#    → --cpu 를 넘겨주면 156~157 줄에서 cpu_state 가 CPU 로 바뀌고,
-#      362 줄보다 앞이라 CUDA 초기화를 아예 안 한다. 소스로 순서까지 확인했다.
-#    → cwd 가 /comfyui 라 python -c 가 알아서 comfy 패키지를 찾는다.
-RUN cd /comfyui && timeout 600 python main.py --quick-test-for-ci --cpu \
- && cd /comfyui && python -c "\
-import sys; sys.argv = ['main.py', '--cpu']; \
-import comfy.options; comfy.options.enable_args_parsing(); \
-import comfy.sd as s; \
-assert hasattr(s.CLIPType, 'KREA2'), 'CLIPType.KREA2 가 없다'; \
-print('CLIPType.KREA2 =', int(s.CLIPType.KREA2))"
+# ⚠️ 여기에 Krea2 지원 여부를 확인하는 줄을 따로 붙였다가 빌드를 두 번 말아먹었다
+#    (2026-08-04). comfy.sd 를 import 하면 GPU 를 잡으러 가서 한 번,
+#    CLIPType 이 IntEnum 이 아닌데 int() 로 감싸서 또 한 번.
+#    그 확인은 애초에 필요가 없었다 — ComfyUI 를 v0.29.2 로 고정해뒀고
+#    그 태그 소스에서 CLIPType.KREA2 = 32 를 이미 확인했다.
+#    안 변하는 것을 빌드할 때마다 다시 확인하고 있었던 것이다. 그래서 뺐다.
+RUN cd /comfyui && timeout 600 python main.py --quick-test-for-ci --cpu
 
 COPY handler_krea2.py /handler_krea2.py
 
