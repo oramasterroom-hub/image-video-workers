@@ -15,48 +15,48 @@
 #   → ComfyUI 를 우리가 태그로 직접 받는다. 구조는 worker-comfyui 를 참고했다.
 # ──────────────────────────────────────────────────────────────────────
 
-# ⚠️ CUDA 12.8 판이어야 한다 (Qwen 워커에서 2026-08-02 실제로 당한 문제).
+# ⚠️ CUDA 13 판이어야 한다 (Qwen 워커에서 2026-08-02 실제로 당한 문제).
 #    24GB 를 고르면 RTX PRO 6000 Blackwell 의 MIG 조각(sm_120)이 배정될 수 있는데
-#    cu126 파이토치에는 sm_120 커널이 없어서 워커가 즉사한다.
+#    구형 CUDA 판 파이토치에는 sm_120 커널이 없어서 워커가 즉사한다.
 #    콘솔에서 MIG 를 배제하면 안 만나지만, 체크 하나에 목숨을 걸 이유가 없다.
-#    cu128 은 블랙웰 지원을 위해 나온 빌드라 구형 GPU 와 sm_120 을 모두 덮는다.
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+#
+# ⭐ 2026-08-04 1차 빌드 실패로 배운 것 — cu128 로 가면 안 된다.
+#    cu128 인덱스는 torch 2.11.0 이 최신인데, 그 판의 get_arch_list() 는
+#    GPU 가 없는 빌드 머신에서 빈 목록 [] 을 돌려준다.
+#    = 커널이 있는지 없는지를 빌드 시점에 확인할 방법이 사라진다.
+#    torch 2.13.0+cu130 은 GPU 없이도 ['sm_75'...'sm_120'] 을 제대로 찍는다.
+#    → Qwen 워커와 같은 베이스를 쓴다. 이미 런포드에서 도는 것이 확인된 조합이다.
+FROM pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime
 
 # ⭐ 전부 고정한다. latest·브랜치 추적 금지 (보스 지시 2026-08-04).
 #    latest 로 두면 빌드할 때마다 다른 게 깔려서 오늘 되던 게 내일 깨진다.
 ARG COMFYUI_VERSION=v0.29.2
 ARG COMFYUI_GGUF_COMMIT=80b7ab622b68894de8bf533bfa730a16b58d62b9
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_PREFER_BINARY=1 \
+# ⚠️ HF_HUB_ENABLE_HF_TRANSFER 는 이제 아무 일도 하지 않는다 (2026-08-04 로그에서 확인).
+#    huggingface_hub 가 "deprecated as 'hf_transfer' is not used anymore,
+#    use HF_XET_HIGH_PERFORMANCE instead" 라고 경고한다.
+#    Qwen 워커의 초당 800MB 는 hf_transfer 가 아니라 Xet 이 낸 속도였다.
+#    → 둘 다 켠다. 옛 판이든 새 판이든 빠른 길로 가고, 경고도 안 뜬다.
+ENV PYTHONUNBUFFERED=1 \
     PIP_NO_INPUT=1 \
+    HF_XET_HIGH_PERFORMANCE=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     COMFYUI_PORT=8188
 
+# git 은 ComfyUI 와 커스텀 노드를 받는 데 필요하고,
+# libgl1 / libglib2.0-0 은 ComfyUI 의 이미지 처리 의존성이 요구한다.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.12 \
-      python3.12-venv \
       git \
-      wget \
       ca-certificates \
       libgl1 \
       libglib2.0-0 \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
-# uv 로 격리된 venv 를 만든다. 우분투가 관리하는 파이썬을 건드리지 않기 위해서다.
-# (Qwen 워커에서는 --break-system-packages 로 우회했는데, venv 가 더 깔끔하다)
-RUN wget -qO- https://astral.sh/uv/install.sh | sh \
-    && ln -s /root/.local/bin/uv /usr/local/bin/uv \
-    && uv venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
-
-# ⭐ 파이토치를 먼저 cu128 로 깐다.
-#    ComfyUI requirements.txt 의 `torch` 는 버전이 안 적혀 있어서,
-#    먼저 깔아두면 그 단계에서 건드리지 않고 넘어간다.
-RUN uv pip install --index-url ${TORCH_INDEX_URL} torch torchvision torchaudio
+# ⚠️ pip 업그레이드 줄을 넣지 말 것. 우분투가 깐 pip 는 pip 가 못 지워서 빌드가 통째로 실패한다.
+# ⚠️ `pip` 가 아니라 `python -m pip` 를 쓴다. 실행할 파이썬과 설치할 파이썬을 일치시키기 위해서다.
+# ⚠️ --break-system-packages 를 빼면 externally-managed-environment 로 거부당한다.
+#    (Qwen 워커에서 검증된 방식 그대로다)
 
 # ComfyUI 본체 — 태그로 고정해서 받는다
 RUN git clone --depth 1 --branch ${COMFYUI_VERSION} \
@@ -65,15 +65,21 @@ RUN git clone --depth 1 --branch ${COMFYUI_VERSION} \
 # ⚠️ transformers / huggingface-hub 를 같은 단계에서 못박는다.
 #    ComfyUI 는 상한을 안 걸어놔서 새로 깔면 5.x / 1.x 가 딸려와 시작할 때 죽는다.
 #    (런포드 공식 Dockerfile 에도 같은 주석과 같은 핀이 달려 있다)
-RUN uv pip install -r /comfyui/requirements.txt \
-    && uv pip install "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+# ⚠️ requirements.txt 의 `torch` 는 버전이 안 적혀 있다.
+#    베이스 이미지에 2.13.0+cu130 이 이미 있으므로 그대로 넘어간다.
+RUN python -m pip install --no-cache-dir --break-system-packages \
+      -r /comfyui/requirements.txt \
+ && python -m pip install --no-cache-dir --break-system-packages \
+      "transformers>=4.50.3,<5" "huggingface-hub<1.0"
 
 # handler 가 쓰는 것 + GGUF 폴백용
 #   runpod       서버리스 진입점
 #   requests     ComfyUI HTTP API 호출
-#   hf_transfer  대용량 다운로드 가속 (초당 800MB 의 정체)
+#   hf_xet       대용량 다운로드 가속 (초당 800MB 의 실제 정체)
+#   hf_transfer  옛 경로 대비용
 #   gguf         molbal 노드가 요구
-RUN uv pip install runpod requests hf_transfer "gguf>=0.13.0"
+RUN python -m pip install --no-cache-dir --break-system-packages \
+      runpod requests hf_xet hf_transfer "gguf>=0.13.0"
 
 # ──────────────────────────────────────────────────────────────────────
 # GGUF 커스텀 노드 — 폴백 전용. 1안(fp8_scaled)에서는 쓰지 않는다.
@@ -99,11 +105,23 @@ RUN mkdir -p /comfyui/models/diffusion_models \
              /comfyui/models/unet
 
 # ⭐ 빌드 시점 검증. 문제가 있으면 워커를 띄우기 전에 여기서 걸린다 = 요금이 안 나간다.
+#
+# ⚠️ arch list 가 비어 있으면 "커널이 없다"가 아니라 "확인할 수 없다"는 뜻일 수 있다.
+#    torch 2.11 계열은 GPU 없는 기계에서 빈 목록을 돌려준다(2026-08-04 1차 빌드에서 당함).
+#    그래서 빈 경우와 없는 경우를 나눠서 알린다.
 RUN python -c "import sys; print('python:', sys.executable)" \
  && python -c "import torch; print('torch:', torch.__version__, 'cuda build:', torch.version.cuda)" \
- && python -c "import torch; a=torch.cuda.get_arch_list(); print('arch list:', a); assert any('120' in x for x in a), 'sm_120(블랙웰) 커널이 없는 파이토치다'" \
- && python -c "import runpod, requests, hf_transfer, gguf; print('runpod/requests/hf_transfer/gguf OK')" \
- && python -c "from huggingface_hub import hf_hub_download; print('huggingface_hub OK')"
+ && python -c "\
+import torch; \
+a = torch.cuda.get_arch_list(); \
+print('arch list:', a); \
+assert a, 'arch list 가 비었다. 이 torch 판으로는 빌드 시점 확인이 불가능하다 (cu128/torch2.11 계열)'; \
+assert any('120' in x for x in a), 'sm_120(블랙웰) 커널이 없는 파이토치다'" \
+ && python -c "import runpod, requests, gguf; print('runpod/requests/gguf OK')" \
+ && python -c "\
+import huggingface_hub as h; \
+print('huggingface_hub:', h.__version__); \
+import hf_xet; print('hf_xet OK — Xet 고속 전송 사용 가능')"
 
 # ⭐ ComfyUI 를 실제로 한 번 띄워본다(CPU). 노드 그래프를 전부 import 하므로
 #    커스텀 노드가 깨졌거나 의존성이 어긋났으면 여기서 잡힌다.
