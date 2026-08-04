@@ -17,7 +17,11 @@ env:
   #   enable_model_cpu_offload() 는 세 덩어리를 전부 CPU 에 대기시켜 37GiB 를 썼다.
   #   컨테이너 RAM 한도가 46.57GiB 라 생성 시작하며 터졌다(exit 137).
   #   → 트랜스포머·VAE 는 GPU 상주, 글 읽는 부분만 CPU 에 두고 레이어 단위로 사용.
-  IMAGE_TAG: v2
+  # v3 (2026-08-04): accelerate.cpu_offload 제거.
+  #   그건 모델을 meta(빈 껍데기)로 만드는 방식이라 Qwen2_5_VL 과 안 맞아
+  #   "Cannot copy out of meta tensor" 로 죽었다.
+  #   → 글 읽는 부분을 평범하게 CPU 에 두고 encode_prompt(device="cpu") 로 직접 부른다.
+  IMAGE_TAG: v3
 
 jobs:
   build:

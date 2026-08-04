@@ -56,8 +56,6 @@ try:
         QwenImageTransformer2DModel,
         GGUFQuantizationConfig,
     )
-    from accelerate import cpu_offload
-
     print("[init] diffusers/huggingface_hub 불러오기 OK", flush=True)
 except Exception:
     print("[init] ⚠️ 불러오기 단계에서 실패했다", flush=True)
@@ -185,14 +183,26 @@ try:
     # 트랜스포머가 GPU 에 상주하므로 50스텝 생성이 빠르다.
     #
     # ⚠️ 글 읽는 부분(8.3B)을 통째로 GPU 에 올리면 20.27+15.44=35.7 로 24GB 를 넘는다.
-    #    그래서 cpu_offload 로 레이어를 하나씩만 올렸다 내린다.
-    #    대가: 프롬프트 읽는 게 느려진다. 다만 50스텝 생성은 영향 없다.
+    #    그래서 CPU 에 둔 채로 CPU 에서 프롬프트를 읽는다.
+    #    대가: 프롬프트 읽는 게 느려진다. 다만 50스텝 생성은 GPU 라 영향 없다.
+    #
+    # ⚠️ 2026-08-04 2차 시도 실패 기록.
+    #    accelerate 의 cpu_offload() 를 썼다가 실패했다.
+    #    그건 모델을 meta(빈 껍데기) 로 만들고 훅으로 값을 가져오는 방식인데,
+    #    transformers 의 Qwen2_5_VL 이 그 훅과 안 맞아서
+    #    "NotImplementedError: Cannot copy out of meta tensor" 로 죽었다.
+    #    → 자동 도구를 쓰지 말고 평범하게 CPU 에 두고 우리가 직접 부른다.
     PIPE.transformer.to("cuda")
     PIPE.vae.to("cuda")
-    print("[init] 트랜스포머·VAE 를 GPU 에 올림", flush=True)
+    PIPE.text_encoder.to("cpu")
+    print("[init] 트랜스포머·VAE 는 GPU, 글 읽는 부분은 CPU 에 배치", flush=True)
 
-    cpu_offload(PIPE.text_encoder, execution_device=torch.device("cuda"))
-    print("[init] 글 읽는 부분은 CPU 에 두고 레이어 단위로만 GPU 사용", flush=True)
+    # ⚠️ 파이프라인은 "지금 어느 장치에서 도는가"를 components 중 하나를 보고 판단한다.
+    #    글 읽는 부분이 CPU 에 있으면 CPU 로 착각해서 잠재변수를 CPU 에 만들고,
+    #    GPU 에 있는 트랜스포머와 장치가 어긋나 죽는다.
+    #    항상 cuda 로 답하도록 고정한다.
+    type(PIPE)._execution_device = property(lambda self: torch.device("cuda"))
+    print(f"[init] 실행 장치 고정: {PIPE._execution_device}", flush=True)
 
     # ⑥ 마지막 펼치는 단계를 조각내서 처리한다. 화질을 깎는 설정이 아니다.
     #    ⚠️ 2026-08-03 확인: 이 기능은 파이프라인이 아니라 VAE 쪽에 있다.
@@ -260,9 +270,35 @@ def handler(event):
 
     t_start = time.time()
     try:
+        # ⭐ 프롬프트 읽기는 CPU 에서 한다. 글 읽는 부분이 CPU 에 있기 때문이다.
+        #    소스로 확인한 것 (diffusers 0.39.0 pipeline_qwenimage.py):
+        #      - prompt 와 prompt_embeds 를 동시에 주면 거부한다. embeds 만 준다
+        #      - __call__ 안에서 encode_prompt 가 다시 불리지만,
+        #        embeds 가 이미 있으면 인코딩을 건너뛰고 자르기·복제만 한다.
+        #        한 장씩 뽑는 지금 설정에서는 아무 변화도 없다
+        #      - device 이동은 안 해주므로 우리가 GPU 로 옮겨서 넘겨야 한다
+        #      - negative_prompt_embeds 가 있으면 CFG 가 켜진다
+        cpu = torch.device("cpu")
+        pe, pm = PIPE.encode_prompt(
+            prompt=str(prompt), device=cpu, max_sequence_length=max_seq
+        )
+        ne, nm = PIPE.encode_prompt(
+            prompt=negative_prompt, device=cpu, max_sequence_length=max_seq
+        )
+        encode_sec = time.time() - t_start
+        print(f"[job] 프롬프트 읽기 완료 ({encode_sec:.1f}초, CPU)", flush=True)
+
+        # 읽은 결과만 GPU 로 옮긴다. 글 읽는 부분 자체는 CPU 에 그대로 둔다.
+        pe = pe.to("cuda")
+        pm = pm.to("cuda") if pm is not None else None
+        ne = ne.to("cuda")
+        nm = nm.to("cuda") if nm is not None else None
+
         image = PIPE(
-            prompt=str(prompt),
-            negative_prompt=negative_prompt,
+            prompt_embeds=pe,
+            prompt_embeds_mask=pm,
+            negative_prompt_embeds=ne,
+            negative_prompt_embeds_mask=nm,
             width=width,
             height=height,
             num_inference_steps=steps,
@@ -315,6 +351,7 @@ def handler(event):
         # ⭐ 이번 작업의 목적. 이 숫자 하나를 보려고 만든 것이다.
         "gpu_peak_gb": round(torch.cuda.max_memory_allocated() / 1024**3, 2),
         "generation_sec": round(elapsed, 1),
+        "encode_sec": round(encode_sec, 1),
     }
 
     if off_list:
