@@ -21,6 +21,7 @@ Qwen-Image-2512 (GGUF Q8_0) 런포드 서버리스 handler
 
 import base64
 import io
+import math
 import os
 import sys
 import time
@@ -55,6 +56,7 @@ try:
         QwenImagePipeline,
         QwenImageTransformer2DModel,
         GGUFQuantizationConfig,
+        FlowMatchEulerDiscreteScheduler,
     )
     print("[init] diffusers/huggingface_hub 불러오기 OK", flush=True)
 except Exception:
@@ -71,10 +73,31 @@ BASE_REPO = os.environ.get("BASE_REPO", "Qwen/Qwen-Image-2512")
 
 TORCH_DTYPE = getattr(torch, os.environ.get("TORCH_DTYPE", "bfloat16"))
 
+# ──────────────────────────────────────────────────────────────────────
+# ⭐ 터보 스위치 (2026-08-04 추가)
+#
+# LORA_REPO 가 비어 있으면 이 파일은 예전과 한 글자도 다르지 않게 동작한다.
+# 채워져 있으면 증류 LoRA 를 얹어 50스텝 → 8스텝으로 줄인다.
+#
+# ⚠️ 기존 엔드포인트(Qwen-Image-2512)는 이미 구워둔 v3 이미지를 보고 있어서
+#    이 파일을 고쳐도 영향을 받지 않는다. 새 이미지는 v4 태그로 굽는다.
+#
+# 설정값 출처: ModelTC/Qwen-Image-Lightning generate_with_diffusers.py 원문
+#   num_inference_steps = 50 if lora_path is None else 8
+#   true_cfg_scale      = 4.0 if lora_path is None else 1.0
+# ──────────────────────────────────────────────────────────────────────
+LORA_REPO = os.environ.get("LORA_REPO", "").strip()
+LORA_FILE = os.environ.get("LORA_FILE", "").strip()
+LORA_SCALE = float(os.environ.get("LORA_SCALE", "1.0"))
+TURBO = bool(LORA_REPO and LORA_FILE)
+
 # ⭐ 공식 모델 카드 기준값 (2026-08-04 README 원문 확인)
 #    ⚠️ guidance_scale 이 아니라 true_cfg_scale 이다. 이름이 이전 모델들과 다르다.
-DEFAULT_STEPS = 50
-DEFAULT_TRUE_CFG = 4.0
+DEFAULT_STEPS = 8 if TURBO else 50
+# ⚠️ 터보에서 1.0 인 것은 화질을 깎는 설정이 아니다.
+#    증류할 때 CFG 를 모델 안으로 흡수시켰기 때문에(CFG-distillation) 1.0 이 정상값이다.
+#    그 덕에 네거티브 계산을 통째로 건너뛰어 속도가 두 배가 된다.
+DEFAULT_TRUE_CFG = 1.0 if TURBO else 4.0
 DEFAULT_SEED = 32
 # ⚠️ diffusers 안에서 기본값이 서로 다르다.
 #    __call__ 은 512, encode_prompt 는 1024. 헷갈리지 않게 명시해서 넘긴다.
@@ -164,6 +187,51 @@ try:
         torch_dtype=TORCH_DTYPE,
     )
     print("[init] 파이프라인 생성 완료", flush=True)
+
+    # ④-2 ⭐ 터보 LoRA — 스위치가 켜져 있을 때만 탄다
+    #
+    # ⚠️ LoRA 만 얹고 스텝을 줄이면 안 된다. 스케줄러를 같이 갈아끼워야 한다.
+    #    증류할 때 shift=3 을 썼기 때문에, 그 값에 맞춰야 8스텝이 제대로 나온다.
+    #    아래 설정은 ModelTC/Qwen-Image-Lightning 의 코드 원문 그대로다.
+    #
+    # ⚠️ GGUF 에 LoRA 를 얹어도 모델이 통째로 풀리지 않는다는 것을 소스로 확인했다.
+    #    diffusers 0.39.0 lora_pipeline.py 의 GGUF 해제 코드는
+    #    _maybe_dequantize_weight_for_expanded_lora() 안에 있는데,
+    #    그건 LoRA 가 입력 채널 수를 바꾸는 특수한 경우에만 불린다.
+    #    평범한 증류 LoRA 는 그 경우가 아니라 이 함수를 안 탄다.
+    #    (통째로 풀렸다면 Q8 21GB 가 bf16 40GB 로 부풀어 24GB 를 넘겼을 것이다)
+    if TURBO:
+        _t2 = time.time()
+        print(f"[init] 터보 켜짐 — LoRA 받는 중: {LORA_REPO}/{LORA_FILE}", flush=True)
+        lora_path = hf_hub_download(repo_id=LORA_REPO, filename=LORA_FILE)
+
+        PIPE.scheduler = FlowMatchEulerDiscreteScheduler.from_config({
+            "base_image_seq_len": 256,
+            "base_shift": math.log(3),   # 증류에 shift=3 을 썼다
+            "invert_sigmas": False,
+            "max_image_seq_len": 8192,
+            "max_shift": math.log(3),
+            "num_train_timesteps": 1000,
+            "shift": 1.0,
+            "shift_terminal": None,
+            "stochastic_sampling": False,
+            "time_shift_type": "exponential",
+            "use_beta_sigmas": False,
+            "use_dynamic_shifting": True,
+            "use_exponential_sigmas": False,
+            "use_karras_sigmas": False,
+        })
+        print("[init] 스케줄러 교체 완료 (shift=3 계열)", flush=True)
+
+        # ⚠️ fuse 하지 않는다. fuse 하면 GGUF 를 풀어서 원본 가중치에 합치는데
+        #    그러면 24GB 를 넘긴다. 얹어만 두고 생성할 때마다 더하는 방식으로 쓴다.
+        PIPE.load_lora_weights(lora_path)
+        print(f"[init] LoRA 적용 완료 ({time.time() - _t2:.0f}초) "
+              f"scale={LORA_SCALE} / {DEFAULT_STEPS}스텝 / CFG {DEFAULT_TRUE_CFG}",
+              flush=True)
+    else:
+        print(f"[init] 터보 꺼짐 — 원래대로 {DEFAULT_STEPS}스텝 / "
+              f"CFG {DEFAULT_TRUE_CFG}", flush=True)
 
     # ⑤ ⭐ 메모리 전략
     #
@@ -282,16 +350,22 @@ def handler(event):
         pe, pm = PIPE.encode_prompt(
             prompt=str(prompt), device=cpu, max_sequence_length=max_seq
         )
-        ne, nm = PIPE.encode_prompt(
-            prompt=negative_prompt, device=cpu, max_sequence_length=max_seq
-        )
+        # ⚠️ true_cfg_scale 이 1.0 이하면 diffusers 가 네거티브를 아예 안 쓴다
+        #    (do_true_cfg = true_cfg_scale > 1). 그런데 글 읽는 부분이 CPU 에 있어서
+        #    한 번 읽는 데 4초쯤 걸린다. 안 쓸 걸 읽느라 4초를 버리지 않는다.
+        if true_cfg > 1.0:
+            ne, nm = PIPE.encode_prompt(
+                prompt=negative_prompt, device=cpu, max_sequence_length=max_seq
+            )
+        else:
+            ne = nm = None
         encode_sec = time.time() - t_start
         print(f"[job] 프롬프트 읽기 완료 ({encode_sec:.1f}초, CPU)", flush=True)
 
         # 읽은 결과만 GPU 로 옮긴다. 글 읽는 부분 자체는 CPU 에 그대로 둔다.
         pe = pe.to("cuda")
         pm = pm.to("cuda") if pm is not None else None
-        ne = ne.to("cuda")
+        ne = ne.to("cuda") if ne is not None else None
         nm = nm.to("cuda") if nm is not None else None
 
         image = PIPE(
@@ -345,7 +419,10 @@ def handler(event):
         "steps": steps,
         "true_cfg_scale": true_cfg,
         "max_sequence_length": max_seq,
-        "negative_prompt_used": bool(negative_prompt),
+        # ⚠️ CFG 1.0 이면 네거티브를 넣어도 계산에 안 들어간다. 실제로 쓰였는지를 적는다.
+        "negative_prompt_used": bool(negative_prompt) and true_cfg > 1.0,
+        "turbo": TURBO,
+        "lora": f"{LORA_REPO}/{LORA_FILE}" if TURBO else None,
         "model": f"{GGUF_REPO}/{GGUF_FILE}",
         "dtype": str(TORCH_DTYPE).replace("torch.", ""),
         # ⭐ 이번 작업의 목적. 이 숫자 하나를 보려고 만든 것이다.

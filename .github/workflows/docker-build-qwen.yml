@@ -21,7 +21,11 @@ env:
   #   그건 모델을 meta(빈 껍데기)로 만드는 방식이라 Qwen2_5_VL 과 안 맞아
   #   "Cannot copy out of meta tensor" 로 죽었다.
   #   → 글 읽는 부분을 평범하게 CPU 에 두고 encode_prompt(device="cpu") 로 직접 부른다.
-  IMAGE_TAG: v3
+  # v4 (2026-08-04): 터보 LoRA 스위치 추가.
+  #   LORA_REPO/LORA_FILE 이 비어 있으면 v3 와 완전히 동일하게 동작한다.
+  #   채워져 있으면 증류 LoRA 를 얹고 스케줄러를 갈아끼워 50스텝 → 8스텝.
+  #   ⚠️ v3 는 그대로 둔다. 기존 Qwen-Image-2512 엔드포인트가 v3 를 보고 있다.
+  IMAGE_TAG: v4
 
 jobs:
   build:
