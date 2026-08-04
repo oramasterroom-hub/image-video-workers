@@ -56,6 +56,7 @@ try:
         QwenImageTransformer2DModel,
         GGUFQuantizationConfig,
     )
+    from accelerate import cpu_offload
 
     print("[init] diffusers/huggingface_hub 불러오기 OK", flush=True)
 except Exception:
@@ -77,6 +78,9 @@ TORCH_DTYPE = getattr(torch, os.environ.get("TORCH_DTYPE", "bfloat16"))
 DEFAULT_STEPS = 50
 DEFAULT_TRUE_CFG = 4.0
 DEFAULT_SEED = 32
+# ⚠️ diffusers 안에서 기본값이 서로 다르다.
+#    __call__ 은 512, encode_prompt 는 1024. 헷갈리지 않게 명시해서 넘긴다.
+DEFAULT_MAX_SEQ = 512
 
 # ⭐ 공식이 지정한 해상도 7개. 이 목록 밖 크기는 모델이 학습하지 않아 결과가 나빠진다.
 OFFICIAL_SIZES = {
@@ -163,12 +167,32 @@ try:
     )
     print("[init] 파이프라인 생성 완료", flush=True)
 
-    # ⑤ ⭐ 메모리 전략 — 세 덩어리를 한꺼번에 올리면 24GB 를 확실히 넘긴다.
-    #      트랜스포머 20.27 + 글읽는부분 15.44 + VAE 0.24 = 35.95 GiB
-    #    그래서 쓰는 순서대로 올렸다 내린다.
-    #    런포드 워커는 RAM 이 500GB 라 CPU 에 얹어두는 데 문제없다.
-    PIPE.enable_model_cpu_offload()
-    print("[init] CPU 오프로드 켬 (순서대로 올렸다 내린다)", flush=True)
+    # ⑤ ⭐ 메모리 전략
+    #
+    # ⚠️ 2026-08-04 1차 시도 실패 기록.
+    #    처음에는 PIPE.enable_model_cpu_offload() 를 썼는데, 그건 세 덩어리를
+    #    전부 CPU 메모리에 대기시킨다. 그래서 CPU 쪽에서 터졌다.
+    #      트랜스포머 20.27 + 글읽는부분 15.44 + VAE 0.24 + 오버헤드 = 37.33 GiB
+    #      컨테이너 RAM 한도 46.57 GiB → 80% 를 쓰고 있다가 생성 시작하며 OOM(exit 137)
+    #    ⚠️ 워커 로그의 "503GB available" 은 기계 전체 값이지 우리 컨테이너 몫이 아니다.
+    #       우리 몫은 46.57 GiB 다. 이걸 잘못 읽어서 설계가 틀렸다.
+    #
+    # 그래서 배치를 바꾼다.
+    #   트랜스포머 + VAE → GPU 상주    (20.51 GiB / 24GB)
+    #   글 읽는 부분     → CPU 상주    (15.44 GiB / 46.57GiB)
+    #
+    # 이러면 CPU 메모리가 37 → 17 GiB 로 줄어 여유가 넉넉해지고,
+    # 트랜스포머가 GPU 에 상주하므로 50스텝 생성이 빠르다.
+    #
+    # ⚠️ 글 읽는 부분(8.3B)을 통째로 GPU 에 올리면 20.27+15.44=35.7 로 24GB 를 넘는다.
+    #    그래서 cpu_offload 로 레이어를 하나씩만 올렸다 내린다.
+    #    대가: 프롬프트 읽는 게 느려진다. 다만 50스텝 생성은 영향 없다.
+    PIPE.transformer.to("cuda")
+    PIPE.vae.to("cuda")
+    print("[init] 트랜스포머·VAE 를 GPU 에 올림", flush=True)
+
+    cpu_offload(PIPE.text_encoder, execution_device=torch.device("cuda"))
+    print("[init] 글 읽는 부분은 CPU 에 두고 레이어 단위로만 GPU 사용", flush=True)
 
     # ⑥ 마지막 펼치는 단계를 조각내서 처리한다. 화질을 깎는 설정이 아니다.
     #    ⚠️ 2026-08-03 확인: 이 기능은 파이프라인이 아니라 VAE 쪽에 있다.
@@ -186,8 +210,12 @@ except Exception:
     raise
 
 print(f"[init] 모델 로딩 완료 (총 {time.time() - _t0:.0f}초)", flush=True)
+# ⚠️ 1차 시도 때는 전부 CPU 에 있어서 이 값이 0.00 이라 아무 정보가 없었다.
+#    이제 트랜스포머가 GPU 에 상주하므로 실제 점유량이 찍힌다.
 print(
-    f"[init] GPU 점유: {torch.cuda.memory_allocated() / 1024**3:.2f} GiB", flush=True
+    f"[init] GPU 점유: {torch.cuda.memory_allocated() / 1024**3:.2f} GiB "
+    f"(예약 {torch.cuda.memory_reserved() / 1024**3:.2f} GiB)",
+    flush=True,
 )
 
 
@@ -222,6 +250,7 @@ def handler(event):
     steps = int(job.get("steps", DEFAULT_STEPS))
     true_cfg = float(job.get("true_cfg_scale", DEFAULT_TRUE_CFG))
     seed = int(job.get("seed", DEFAULT_SEED))
+    max_seq = int(job.get("max_sequence_length", DEFAULT_MAX_SEQ))
 
     # 공식 목록 밖 크기면 알려준다. 막지는 않는다 — 실측이 목적이라 실험 여지를 남긴다.
     off_list = (width, height) not in OFFICIAL_SIZES.values()
@@ -238,6 +267,7 @@ def handler(event):
             height=height,
             num_inference_steps=steps,
             true_cfg_scale=true_cfg,
+            max_sequence_length=max_seq,
             generator=torch.Generator("cuda").manual_seed(seed),
         ).images[0]
     # ⚠️ except 에서 응답만 돌려보내면 로그에 흔적이 안 남는다.
@@ -278,6 +308,7 @@ def handler(event):
         "seed": seed,
         "steps": steps,
         "true_cfg_scale": true_cfg,
+        "max_sequence_length": max_seq,
         "negative_prompt_used": bool(negative_prompt),
         "model": f"{GGUF_REPO}/{GGUF_FILE}",
         "dtype": str(TORCH_DTYPE).replace("torch.", ""),
