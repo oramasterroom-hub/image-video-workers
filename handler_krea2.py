@@ -118,6 +118,28 @@ LORA_SPECS = [
     for i, f in enumerate(_LORA_FILES)
 ]
 
+# ⭐ v8 (2026-08-06): LoRA 에서 특정 층을 빼고 쓴다.
+#
+#    왜: 체형 LoRA 를 얹으면 특정 부위에 검열 처리(블러·모자이크·착의)가 그려진다.
+#        실측으로 LoRA 없으면 안 걸리고, 강도가 셀수록 심해지는 것을 확인했다.
+#        그리고 이 LoRA 는 512개 텐서 중 64개가 txtfusion(프롬프트 해석부)을 건드린다.
+#        프롬프트·cfg·강도·스텝으로는 통제가 안 됐다 — 해석 통로 자체가 개조되기 때문으로 추정.
+#        ⚠️ "txtfusion 이 원인"은 아직 추정이다. blocks 쪽일 수도 있다.
+#           그래서 무엇을 뺄지 고를 수 있게 만들었다. 빼고 뽑아보면 그 자리에서 갈린다.
+#
+#    쓰는 법: 텐서 이름에 들어갈 조각을 쉼표로 나열한다. 대소문자 무시.
+#      LORA_SKIP_KEYS=txtfusion       → 64개 제외, 448개(체형) 적용
+#      LORA_SKIP_KEYS=blocks.         → 448개 제외, 64개만 적용
+#      LORA_SKIP_KEYS=(비움)          → 아무것도 안 뺌 = v7 과 완전히 동일
+#
+#    ⚠️ 함정: "blocks" 로 쓰면 txtfusion.refiner_blocks / layerwise_blocks 까지 걸려서
+#            LoRA 가 통째로 사라진다. 진짜 본체만 빼려면 점을 붙여 "blocks." 로 쓸 것.
+LORA_SKIP_KEYS = [
+    x.strip().lower()
+    for x in os.environ.get("LORA_SKIP_KEYS", "").split(",")
+    if x.strip()
+]
+
 # ⭐ 보스가 정한 값 (2026-08-04). 원출처는 Civitai 실사 워크플로 krea2_simple_v1.
 #    ⚠️ Turbo 단독으로 쓸 때는 STEPS=8 로 내려야 한다 (Krea 공식 권장).
 DEFAULT_LORA_STRENGTH = LORA_SPECS[0]["strength"] if LORA_SPECS else 0.6
@@ -219,6 +241,52 @@ def _download_one(repo_id, filename, comfy_folder):
     return size
 
 
+def strip_lora_keys(path):
+    """LoRA 에서 LORA_SKIP_KEYS 에 걸리는 텐서를 빼고 덮어쓴다. (v8)
+
+    워커가 뜰 때 한 번만 돈다. LORA_SKIP_KEYS 가 비어 있으면 아무것도 안 한다.
+
+    ⚠️ 실패하면 원본을 그대로 둔다. 검열이 남더라도 워커가 죽는 것보다 낫다.
+       (safetensors 를 다시 쓰다 깨지면 ComfyUI 가 로드 자체를 못 한다)
+    """
+    if not LORA_SKIP_KEYS:
+        return
+
+    try:
+        from safetensors.torch import load_file, save_file
+
+        tensors = load_file(path)
+        before = len(tensors)
+
+        kept = {}
+        dropped = []
+        for name, t in tensors.items():
+            low = name.lower()
+            if any(k in low for k in LORA_SKIP_KEYS):
+                dropped.append(name)
+            else:
+                kept[name] = t
+
+        if not dropped:
+            log(f"[lora] ⚠️ SKIP_KEYS={LORA_SKIP_KEYS} 에 걸린 텐서가 없다. "
+                f"이름을 잘못 적었을 수 있다. 원본 그대로 쓴다 ({before}개)")
+            return
+
+        if not kept:
+            log(f"[lora] ⚠️ SKIP_KEYS={LORA_SKIP_KEYS} 가 전부를 걸러냈다({before}개). "
+                f"LoRA 가 통째로 사라지므로 원본 그대로 쓴다. "
+                f"'blocks' 대신 'blocks.' 처럼 점을 붙여볼 것")
+            return
+
+        save_file(kept, path)
+        log(f"[lora] {os.path.basename(path)} — {before}개 → {len(kept)}개 "
+            f"({len(dropped)}개 제외, keys={LORA_SKIP_KEYS})")
+        log(f"[lora] 제외한 것 예시: {dropped[:3]}")
+
+    except Exception as e:
+        log(f"[lora] ⚠️ 층 제외 실패, 원본 그대로 쓴다: {type(e).__name__}: {e}")
+
+
 def download_models():
     jobs = _plan_downloads()
     _lora_names = ", ".join(os.path.basename(s["file"]) for s in LORA_SPECS) or "없음"
@@ -240,6 +308,11 @@ def download_models():
         f"({(total / 1024**2) / sec:.0f} MB/s 평균)")
     _boot_stats["download_sec"] = round(sec, 1)
     _boot_stats["download_gib"] = round(total / 1024**3, 2)
+
+    # v8: 받아둔 LoRA 에서 지정한 층을 뺀다. SKIP_KEYS 가 비어 있으면 아무것도 안 한다.
+    for spec in LORA_SPECS:
+        strip_lora_keys(os.path.join(MODELS_DIR, "loras",
+                                     os.path.basename(spec["file"])))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -692,6 +765,8 @@ def handler(event):
             for s in loras
         ] or None,
         "lora_start_step": start_step if loras else None,
+        # v8: 어떤 층을 뺐는지. 비었으면 아무것도 안 뺀 것(v7 과 동일 동작)
+        "lora_skip_keys": LORA_SKIP_KEYS or None,
         # 아래 둘은 v6 과 형식을 맞추기 위해 남겨둔다 (첫 번째 LoRA 기준)
         "lora_strength": loras[0]["strength"] if loras else None,
         "sampler": sampler,
