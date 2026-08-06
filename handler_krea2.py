@@ -75,22 +75,67 @@ VAE_FILE = os.environ.get("VAE_FILE", "vae/qwen_image_vae.safetensors").strip()
 #    2026-08-05: 빈 문자열이나 공백은 쓰면 안 된다.
 #    런포드가 빈 값을 버려서 handler 의 기본값(Turbo LoRA)이 되살아난다.
 #    API 로 조회하면 " " 가 저장돼 보이는데도 컨테이너에는 안 들어온다. 실제로 당했다.
-LORA_REPO = os.environ.get("LORA_REPO", COMFY_REPO).strip()
-LORA_FILE = os.environ.get(
+#
+# ⭐ v7 (2026-08-06): LoRA 를 여러 개 쓸 수 있다. 쉼표로 나열한다.
+#    LORA_FILE     = body.safetensors,face.safetensors
+#    LORA_REPO     = repoA,repoB      (부족하면 마지막 값을 나머지에 적용)
+#    LORA_STRENGTH = 0.6,0.8          (부족하면 마지막 값을 나머지에 적용)
+#    ⚠️ 쉼표가 없으면 v6 과 100% 동일하게 동작한다.
+LORA_REPO_RAW = os.environ.get("LORA_REPO", COMFY_REPO).strip()
+LORA_FILE_RAW = os.environ.get(
     "LORA_FILE", "loras/krea2_turbo_lora_rank_64_bf16.safetensors").strip()
-USE_LORA = LORA_FILE.lower() not in ("", "none", "off", "-", "0", "false")
+LORA_STRENGTH_RAW = os.environ.get("LORA_STRENGTH", "0.6").strip()
+
+USE_LORA = LORA_FILE_RAW.lower() not in ("", "none", "off", "-", "0", "false")
+
+
+def _split_csv(s):
+    """쉼표로 나눈다. 빈 조각은 버린다."""
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _pick(lst, i, fallback):
+    """i 번째 값을 준다. 목록이 짧으면 마지막 값을 쓴다.
+
+    저장소나 강도를 하나만 적어도 모든 LoRA 에 적용되게 하기 위한 것이다.
+    """
+    if not lst:
+        return fallback
+    return lst[i] if i < len(lst) else lst[-1]
+
+
+_LORA_FILES = _split_csv(LORA_FILE_RAW) if USE_LORA else []
+_LORA_REPOS = _split_csv(LORA_REPO_RAW)
+_LORA_STRENGTHS = [float(x) for x in _split_csv(LORA_STRENGTH_RAW)]
+
+# 받아둘 LoRA 목록. 워커가 뜰 때 이 순서대로 받고, 이 순서대로 사슬에 건다.
+LORA_SPECS = [
+    {
+        "repo": _pick(_LORA_REPOS, i, COMFY_REPO),
+        "file": f,
+        "strength": _pick(_LORA_STRENGTHS, i, 0.6),
+    }
+    for i, f in enumerate(_LORA_FILES)
+]
 
 # ⭐ 보스가 정한 값 (2026-08-04). 원출처는 Civitai 실사 워크플로 krea2_simple_v1.
 #    ⚠️ Turbo 단독으로 쓸 때는 STEPS=8 로 내려야 한다 (Krea 공식 권장).
-DEFAULT_LORA_STRENGTH = float(os.environ.get("LORA_STRENGTH", "0.6"))
+DEFAULT_LORA_STRENGTH = LORA_SPECS[0]["strength"] if LORA_SPECS else 0.6
 DEFAULT_STEPS = int(os.environ.get("STEPS", "12"))
 # CFG 1.0 = 네거티브가 작동하지 않는다. 1 을 넘기면 생성 시간이 2배가 된다.
 DEFAULT_CFG = 1.0
-DEFAULT_SAMPLER = "euler"
-DEFAULT_SCHEDULER = "simple"
-# Qwen 의 9:16 값과 같게 맞췄다. 나란히 비교하기 위해서다.
-DEFAULT_WIDTH = 928
-DEFAULT_HEIGHT = 1664
+# ⭐ v7: LoRA 를 몇 번째 스텝부터 걸지. 0 이면 처음부터 = v6 과 같다.
+#    확산 모델은 구도가 초반 스텝에서 정해지므로, 앞구간을 LoRA 없이 돌리면
+#    구도는 원본이 잡고 체형·질감만 LoRA 가 입힌다. 구도 잘림 대책이다.
+DEFAULT_LORA_START_STEP = int(os.environ.get("LORA_START_STEP", "0"))
+# ⭐ v7: er_sde 로 바꿨다. 체형 LoRA 제작자 권장값이고, 실측에서 화질이 뚜렷이 좋았다
+#    (필름 입자감·모공이 살아나고 속도 손해도 없었다. 2026-08-06).
+DEFAULT_SAMPLER = os.environ.get("SAMPLER", "er_sde").strip()
+DEFAULT_SCHEDULER = os.environ.get("SCHEDULER", "simple").strip()
+# ⭐ v7: 환경변수로 뺐다. 원래 Qwen 의 9:16 값을 그대로 쓰던 것이라
+#    Krea 2 최적값을 찾으면 템플릿만 고쳐서 바꿀 수 있게 했다.
+DEFAULT_WIDTH = int(os.environ.get("WIDTH", "928"))
+DEFAULT_HEIGHT = int(os.environ.get("HEIGHT", "1664"))
 DEFAULT_SEED = 42
 
 # 콜드스타트 실측용. 첫 응답에 담아 보낸다.
@@ -136,8 +181,9 @@ def _plan_downloads():
         (TE_REPO, TE_FILE, "text_encoders"),
         (VAE_REPO, VAE_FILE, "vae"),
     ]
-    if USE_LORA:
-        jobs.append((LORA_REPO, LORA_FILE, "loras"))
+    # v7: 나열된 LoRA 를 전부 받는다. 하나만 적었으면 하나만 받는다.
+    for spec in LORA_SPECS:
+        jobs.append((spec["repo"], spec["file"], "loras"))
     return jobs
 
 
@@ -175,9 +221,10 @@ def _download_one(repo_id, filename, comfy_folder):
 
 def download_models():
     jobs = _plan_downloads()
+    _lora_names = ", ".join(os.path.basename(s["file"]) for s in LORA_SPECS) or "없음"
     log(f"[download] {len(jobs)}개 파일 받기 시작 "
         f"(backend={MODEL_BACKEND}, model={MODEL_FILE}, "
-        f"lora={LORA_FILE if USE_LORA else '없음'}, steps={DEFAULT_STEPS})")
+        f"lora={_lora_names}, steps={DEFAULT_STEPS})")
 
     t0 = time.time()
     total = 0
@@ -300,16 +347,23 @@ class VramWatcher(threading.Thread):
 # ──────────────────────────────────────────────────────────────────────
 
 def build_workflow(prompt, negative, width, height, steps, cfg, seed,
-                   lora_strength, sampler, scheduler, backend):
+                   loras, start_step, sampler, scheduler, backend):
     """ComfyUI API 형식 워크플로를 만든다.
 
     노드 구성은 ComfyUI 공식 템플릿(image_krea2_turbo_t2i.json)에서 확인한 것과 같다:
-      UNETLoader → (LoraLoaderModelOnly) → KSampler → VAEDecode → SaveImage
+      UNETLoader → (LoraLoaderModelOnly …) → KSampler → VAEDecode → SaveImage
       CLIPLoader(type=krea2) → CLIPTextEncode → (ConditioningZeroOut)
       VAELoader / EmptyLatentImage
 
     ⚠️ LoRA 노드는 LORA_FILE 이 있을 때만 끼운다.
-       Turbo 체크포인트는 증류가 이미 들어 있어서 LoRA 를 얹으면 안 된다.
+       Turbo 체크포인트는 증류가 이미 들어 있어서 증류 LoRA 를 또 얹으면 안 된다.
+       (체형·얼굴 LoRA 처럼 목적이 다른 것은 얹어도 된다 — 공식 권장 사용법이다)
+
+    ⭐ v7 두 가지가 늘었다
+      1) LoRA 를 여러 개 사슬처럼 잇는다 (노드 40, 41, 42 …)
+      2) start_step 이 0 보다 크면 KSampler 를 둘로 나눈다
+         앞구간은 LoRA 를 안 거친 원본 모델로 돌려 구도를 잡게 하고,
+         뒷구간만 LoRA 를 태워 체형·질감을 입힌다.
     """
     if backend == "gguf":
         # ⚠️ molbal 커스텀 노드가 있어야 동작한다. 이 파일은 models/unet/ 에 있다.
@@ -353,42 +407,11 @@ def build_workflow(prompt, negative, width, height, steps, cfg, seed,
             "class_type": "EmptyLatentImage",
             "inputs": {"width": width, "height": height, "batch_size": 1},
         },
-        "8": {
-            "class_type": "KSampler",
-            "inputs": {
-                # LoRA 를 쓰면 "4"(LoRA 노드), 안 쓰면 "1"(본체)에서 바로 받는다
-                "model": ["4" if USE_LORA else "1", 0],
-                "positive": ["5", 0],
-                "negative": ["6", 0],
-                "latent_image": ["7", 0],
-                "seed": seed,
-                "steps": steps,
-                "cfg": cfg,
-                "sampler_name": sampler,
-                "scheduler": scheduler,
-                "denoise": 1.0,
-            },
-        },
-        "9": {
-            "class_type": "VAEDecode",
-            "inputs": {"samples": ["8", 0], "vae": ["3", 0]},
-        },
         "10": {
             "class_type": "SaveImage",
             "inputs": {"images": ["9", 0], "filename_prefix": "krea2"},
         },
     }
-
-    # LoRA 는 쓸 때만 노드를 끼운다
-    if USE_LORA:
-        wf["4"] = {
-            "class_type": "LoraLoaderModelOnly",
-            "inputs": {
-                "model": ["1", 0],
-                "lora_name": os.path.basename(LORA_FILE),
-                "strength_model": lora_strength,
-            },
-        }
 
     # ⚠️ CFG 가 1.0 이면 네거티브가 계산에 안 들어간다. 빈 조건을 넣는 게 정석이다.
     #    괜히 글을 넣으면 인코딩 시간만 쓰고 결과에는 아무 영향이 없다.
@@ -402,6 +425,90 @@ def build_workflow(prompt, negative, width, height, steps, cfg, seed,
             "class_type": "CLIPTextEncode",
             "inputs": {"clip": ["2", 0], "text": negative},
         }
+
+    # ── LoRA 사슬 ────────────────────────────────────────────────
+    # 본체("1")에서 시작해 LoRA 를 하나씩 이어 붙인다. 마지막 노드가 최종 모델이 된다.
+    # 노드 번호는 40번대를 쓴다. 기존 번호와 부딪히지 않게 하기 위해서다.
+    model_ref = ["1", 0]
+    for i, spec in enumerate(loras):
+        nid = str(40 + i)
+        wf[nid] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": model_ref,
+                "lora_name": os.path.basename(spec["file"]),
+                "strength_model": spec["strength"],
+            },
+        }
+        model_ref = [nid, 0]
+
+    # ── 샘플링 ───────────────────────────────────────────────────
+    if loras and 0 < start_step < steps:
+        # 앞구간: LoRA 를 안 거친 원본("1")으로 돌린다. 여기서 구도가 정해진다.
+        # ⚠️ return_with_leftover_noise=enable 로 노이즈를 남겨 뒷구간에 넘긴다.
+        wf["8"] = {
+            "class_type": "KSamplerAdvanced",
+            "inputs": {
+                "model": ["1", 0],
+                "positive": ["5", 0],
+                "negative": ["6", 0],
+                "latent_image": ["7", 0],
+                "add_noise": "enable",
+                "noise_seed": seed,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": sampler,
+                "scheduler": scheduler,
+                "start_at_step": 0,
+                "end_at_step": start_step,
+                "return_with_leftover_noise": "enable",
+            },
+        }
+        # 뒷구간: LoRA 사슬을 태운다. 체형·질감이 여기서 입혀진다.
+        # ⚠️ add_noise=disable 이어야 앞구간 결과를 그대로 이어받는다.
+        #    enable 로 두면 노이즈가 두 번 들어가 그림이 망가진다.
+        wf["81"] = {
+            "class_type": "KSamplerAdvanced",
+            "inputs": {
+                "model": model_ref,
+                "positive": ["5", 0],
+                "negative": ["6", 0],
+                "latent_image": ["8", 0],
+                "add_noise": "disable",
+                "noise_seed": seed,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": sampler,
+                "scheduler": scheduler,
+                "start_at_step": start_step,
+                "end_at_step": steps,
+                "return_with_leftover_noise": "disable",
+            },
+        }
+        latent_out = ["81", 0]
+    else:
+        # 분기를 안 쓰면 v6 과 똑같이 KSampler 하나로 끝낸다.
+        wf["8"] = {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": model_ref,
+                "positive": ["5", 0],
+                "negative": ["6", 0],
+                "latent_image": ["7", 0],
+                "seed": seed,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": sampler,
+                "scheduler": scheduler,
+                "denoise": 1.0,
+            },
+        }
+        latent_out = ["8", 0]
+
+    wf["9"] = {
+        "class_type": "VAEDecode",
+        "inputs": {"samples": latent_out, "vae": ["3", 0]},
+    }
 
     return wf
 
@@ -459,6 +566,61 @@ def fetch_image(entry):
 # 요청마다
 # ──────────────────────────────────────────────────────────────────────
 
+def resolve_loras(job):
+    """요청에 적힌 LoRA 지정을 받아둔 목록(LORA_SPECS)과 맞춘다.
+
+    반환값은 (목록, 오류메시지) 다. 오류가 있으면 목록은 None 이다.
+
+    방식 A (기존) — loras 를 안 보내면 받아둔 것을 전부 쓴다.
+        lora_strength 를 보내면 모든 LoRA 에 그 강도를 적용한다.
+        LoRA 가 하나뿐이던 v6 과 결과가 같다.
+
+    방식 B (신규) — loras 목록으로 골라 쓴다.
+        {"loras": [{"file": "Radiance", "strength": 0.6}]}
+        file 은 파일명 일부만 적어도 된다. 긴 이름을 다 안 쓰게 하려는 것이다.
+
+    ⚠️ 못 찾으면 조용히 넘어가지 않고 오류로 돌려준다.
+       예전에 LORA_FILE 이 조용히 무시돼서 원인을 못 찾은 적이 있다.
+    """
+    if not LORA_SPECS:
+        return [], None
+
+    req = job.get("loras")
+
+    if req is None:
+        s = job.get("lora_strength")
+        if s is None:
+            return [dict(x) for x in LORA_SPECS], None
+        out = []
+        for spec in LORA_SPECS:
+            d = dict(spec)
+            d["strength"] = float(s)
+            out.append(d)
+        return out, None
+
+    if not isinstance(req, list):
+        return None, "loras 는 목록이어야 한다."
+
+    have = [os.path.basename(s["file"]) for s in LORA_SPECS]
+    out = []
+    for item in req:
+        if not isinstance(item, dict):
+            return None, f"loras 항목이 잘못됐다: {item!r}"
+        key = str(item.get("file", "")).strip()
+        matched = None
+        for spec in LORA_SPECS:
+            if key and key.lower() in os.path.basename(spec["file"]).lower():
+                matched = spec
+                break
+        if matched is None:
+            return None, f"LoRA 를 못 찾았다: '{key}' (워커가 받아둔 것: {have})"
+        d = dict(matched)
+        if item.get("strength") is not None:
+            d["strength"] = float(item["strength"])
+        out.append(d)
+    return out, None
+
+
 def handler(event):
     job = event.get("input") or {}
 
@@ -471,9 +633,13 @@ def handler(event):
     height = int(job.get("height", DEFAULT_HEIGHT))
     steps = int(job.get("steps", DEFAULT_STEPS))
     cfg = float(job.get("cfg", DEFAULT_CFG))
-    lora_strength = float(job.get("lora_strength", DEFAULT_LORA_STRENGTH))
     sampler = str(job.get("sampler", DEFAULT_SAMPLER))
     scheduler = str(job.get("scheduler", DEFAULT_SCHEDULER))
+
+    loras, lora_err = resolve_loras(job)
+    if lora_err:
+        return {"error": lora_err}
+    start_step = int(job.get("lora_start_step", DEFAULT_LORA_START_STEP))
     # ⚠️ backend 는 요청마다 못 바꾼다. 받아둔 파일이 그 하나뿐이기 때문이다.
     #    바꾸려면 템플릿 환경변수(MODEL_BACKEND / MODEL_FILE)를 고쳐야 한다.
     backend = MODEL_BACKEND
@@ -482,15 +648,18 @@ def handler(event):
     seed = random.randint(0, 2**31 - 1) if seed in (None, -1, "random") else int(seed)
 
     wf = build_workflow(str(prompt), str(negative), width, height, steps, cfg,
-                        seed, lora_strength, sampler, scheduler, backend)
+                        seed, loras, start_step, sampler, scheduler, backend)
 
     watcher = VramWatcher()
     watcher.start()
     t0 = time.time()
     try:
         prompt_id = queue_workflow(wf)
+        _lora_desc = ", ".join(
+            f"{os.path.basename(s['file'])}@{s['strength']}" for s in loras) or "없음"
         log(f"[job] 큐 등록 {prompt_id} — {width}x{height} {steps}스텝 "
-            f"cfg{cfg} lora{lora_strength} seed{seed} backend={backend}")
+            f"cfg{cfg} seed{seed} backend={backend} "
+            f"lora=[{_lora_desc}] start_step={start_step} sampler={sampler}")
         entry = wait_for_result(prompt_id, COMFY_PROC)
         payload, filename = fetch_image(entry)
     # ⚠️ except 에서 응답만 돌려보내면 로그에 흔적이 안 남는다.
@@ -517,13 +686,20 @@ def handler(event):
         "seed": seed,
         "steps": steps,
         "cfg": cfg,
-        "lora_strength": lora_strength if USE_LORA else None,
+        # ⭐ v7: 무엇이 실제로 적용됐는지 눈으로 확인할 수 있게 담는다
+        "loras_applied": [
+            {"file": os.path.basename(s["file"]), "strength": s["strength"]}
+            for s in loras
+        ] or None,
+        "lora_start_step": start_step if loras else None,
+        # 아래 둘은 v6 과 형식을 맞추기 위해 남겨둔다 (첫 번째 LoRA 기준)
+        "lora_strength": loras[0]["strength"] if loras else None,
         "sampler": sampler,
         "scheduler": scheduler,
         "backend": backend,
         "model": f"{MODEL_REPO}/{MODEL_FILE}",
         "text_encoder": f"{TE_REPO}/{TE_FILE}",
-        "lora": f"{LORA_REPO}/{LORA_FILE}" if USE_LORA else None,
+        "lora": f"{loras[0]['repo']}/{loras[0]['file']}" if loras else None,
         "negative_prompt_used": bool(negative) and cfg > 1.0,
         "generation_sec": round(elapsed, 1),
         "filename": filename,
