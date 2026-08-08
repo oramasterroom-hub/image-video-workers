@@ -34,7 +34,34 @@ env:
   #      ComfyUI CPU 기동 테스트(v4 에서 통과 확인된 것)와 py_compile 만 남겼다.
   #   ⚠️ 아직 한 번도 안 돌려봤다. GGUF 로더가 LTX-2.3 을 실제로 읽는지는
   #      4단계 실측에서 갈린다.
-  IMAGE_TAG: v1
+  #
+  # ⭐ v1 실측 결과 (2026-08-08 19:27, 첫 생성 성공)
+  #   다운로드 31.50 GiB / 30.1초 (평균 1,071 MB/s) — 부품 경로 7개 전부 맞음, 404 0건
+  #   ComfyUI 기동 9.0초 / 콜드스타트 총 39.2초
+  #   생성 70.6초 (512x320 · 49프레임 · 8스텝 · 순정)
+  #   VRAM 최대 21.29 GB / 전체 23.55 GB (RTX A5000)
+  #   ⭐ 순차 로딩 실증 — 텍스트인코더 12,008MB 로드 → 언로드 → 본체 20,139MB 로드
+  #      "합산이 아니라 최대값" 이 여기서 증명됐다
+  #   ⭐ Q6_K 선택이 옳았다 — 본체가 VRAM 에 20.1GB 로 올라간다.
+  #      Q8_0(23.75GB)이었으면 24GB 를 넘었을 가능성이 크다
+  #
+  # v2 (2026-08-08): v1 로그에서 드러난 문제 하나를 고치고, 부품 추가 통로를 만든다.
+  #   ① ComfyUI-LTXVideo import 실패 수정
+  #      v1 로그: ImportError: cannot import name 'pad' from
+  #               'kornia.geometry.transform.pyramid' → IMPORT FAILED
+  #      kornia 버전 문제가 아니다. v0.7.3~main 전부 확인했는데 어느 버전도 pad 를
+  #      모듈 밖에 노출하지 않는다(pyramid.py 는 import torch.nn.functional as F 만 한다).
+  #      pyramid_blending.py 가 스스로 모순된다 — 31행은 pad(), 144행은
+  #      torch.nn.functional.pad() 를 쓴다. 제작자 실수다.
+  #      → Dockerfile 에서 sed 로 kornia import 목록에서 pad 를 빼고 torch 에서 가져오게 했다.
+  #      ⚠️ 기본 생성에는 필요 없는 노드다(코어 노드만 쓴다). IC-LoRA 를 붙일 때 필요하다.
+  #   ② EXTRA_FILES 환경변수 추가
+  #      부품 목록이 코드에 박혀 있어 하나 추가할 때마다 재빌드를 해야 했다.
+  #      이제 템플릿에 "저장소|경로|폴더" 한 줄을 쓰면 받아진다.
+  #      ⚠️ mmproj(젬마 멀티모달)를 넣자던 앞선 판단은 철회했다 —
+  #         받아도 DualCLIPLoaderGGUF 는 파일 2개만 받아서 쓸 자리가 없다.
+  #         I2V 배선을 만들 때 함께 검토한다.
+  IMAGE_TAG: v2
 
 jobs:
   build:

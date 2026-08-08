@@ -103,6 +103,17 @@ UPS_TEMPORAL_FILE = _env("UPSCALER_TEMPORAL_FILE",
 # DualCLIPLoaderGGUF 의 type 칸. 크레아의 CLIPLoader type="krea2" 와 같은 자리다.
 CLIP_TYPE = _env("CLIP_TYPE", "ltxv")
 
+# ⭐ 부품을 더 받고 싶을 때 쓰는 칸 (v2, 2026-08-08 추가)
+#
+#   EXTRA_FILES = 저장소|저장소안경로|ComfyUI폴더 ; 저장소|저장소안경로|ComfyUI폴더
+#
+#   예) 젬마 멀티모달(mmproj)이 나중에 필요해지면
+#       unsloth/gemma-3-12b-it-qat-GGUF|mmproj-BF16.gguf|text_encoders
+#
+# 왜 만들었나: 부품 목록이 코드에 박혀 있으면 하나 추가할 때마다 재빌드를 해야 한다.
+# 보스 요구가 "고칠 일이 생기면 템플릿만 고쳐서 끝" 이므로, 그 범위를 부품 추가까지 넓힌다.
+EXTRA_FILES = _env("EXTRA_FILES")
+
 # ── 기본값 ────────────────────────────────────────────────────────────
 #
 # ⚠️ 해상도·프레임 기본값은 아직 실측 근거가 없다. "작게 시작한다"는 뜻이지 최적값이 아니다.
@@ -279,7 +290,32 @@ def _base_jobs():
         jobs.append((UPS_SPATIAL_REPO, UPS_SPATIAL_FILE, "latent_upscale_models"))
     if not _off(UPS_TEMPORAL_FILE):
         jobs.append((UPS_TEMPORAL_REPO, UPS_TEMPORAL_FILE, "latent_upscale_models"))
+    jobs.extend(_parse_extra(EXTRA_FILES))
     return jobs
+
+
+def _parse_extra(raw):
+    """EXTRA_FILES 를 읽어 다운로드 목록으로 만든다.
+
+    형식은 카탈로그와 같게 맞췄다 — 파이프(|)로 칸을 나누고 세미콜론/줄바꿈으로 항목을 나눈다.
+        저장소|저장소안경로|ComfyUI폴더
+
+    ⚠️ 잘못된 줄은 건너뛰고 로그에 남긴다. 그것 때문에 워커가 죽지는 않는다.
+    """
+    out = []
+    if _off(raw):
+        return out
+    for line in raw.replace(";", "\n").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3 or not all(parts[:3]):
+            log(f"[extra] ⚠️ 칸이 모자라 건너뜀 (저장소|경로|폴더 형식이어야 한다): {line!r}")
+            continue
+        out.append((parts[0], parts[1], parts[2]))
+        log(f"[extra] 추가 부품: {parts[0]}/{parts[1]} → {parts[2]}/")
+    return out
 
 
 def _preload_names():
