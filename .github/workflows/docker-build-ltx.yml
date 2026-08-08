@@ -1,0 +1,98 @@
+name: Build LTX-2.3 ComfyUI RunPod worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.ltx"
+      - "ltx_core.py"
+      - "handler_ltx.py"
+      - ".github/workflows/docker-build-ltx.yml"
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ltx-runpod
+  # 런포드는 이름표가 같으면 자기 기계에 캐시해둔 옛 이미지를 계속 쓴다.
+  # 코드나 Dockerfile 을 고칠 때마다 이름표를 올린다.
+  #
+  # v1 (2026-08-08): 최초.
+  #   구성 — ComfyUI v0.29.2 (크레아2 와 같은 버전. LTX-2.3 에 필요한 것이
+  #          전부 이 태그에 있음을 하나씩 확인했다)
+  #          베이스 pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime (크레아2 와 동일)
+  #          커스텀 노드 2개 — city96/ComfyUI-GGUF, Lightricks/ComfyUI-LTXVideo
+  #          ffmpeg 추가 (영상 저장에 필요. 크레아2 에는 없던 것)
+  #   배선 — unsloth 가 mp4 에 심어 배포한 검증 워크플로(노드 39개)를 전수로 읽어 옮겼다.
+  #          다만 VAE 로더만 코어 노드로 바꿨다(KJNodes 를 안 넣기 위해).
+  #          같은 파일을 코어가 읽는 것을 키로 확인했다:
+  #            오디오 VAE  audio_vae. 100개 + vocoder. 1,227개
+  #                       → LTXVAudioVAELoader 가 거르는 접두사와 일치
+  #            영상 VAE    decoder.up_blocks.0.res_blocks.0.conv1.conv.weight 존재
+  #                       → comfy/sd.py 691행 감지 키와 일치
+  #   ⚠️ KJNodes 를 뺀 이유: __init__.py 가 모든 노드를 한꺼번에 import 해서
+  #      mss(화면캡처)·matplotlib·opencv 를 다 깔아야 하고, 하나만 실패해도 전체가 죽는다.
+  #   ⚠️ 확인문을 일절 덧붙이지 않았다. 크레아2 빌드 실패 3건이 전부 확인문에서 났다.
+  #      ComfyUI CPU 기동 테스트(v4 에서 통과 확인된 것)와 py_compile 만 남겼다.
+  #   ⚠️ 아직 한 번도 안 돌려봤다. GGUF 로더가 LTX-2.3 을 실제로 읽는지는
+  #      4단계 실측에서 갈린다.
+  IMAGE_TAG: v1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ComfyUI + torch + diffusers 가 커서 러너 디스크가 모자랄 수 있다.
+      - name: 디스크 공간 확보
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 빌드 후 ghcr.io 로 푸시
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.ltx
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          provenance: false
+
+      - name: 이미지 크기 재기
+        run: |
+          IMG=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker pull "$IMG"
+          echo "=============================================="
+          # ⚠️ 고 템플릿에는 div 함수가 없다. 셸에서 나눈다
+          #    (크레아2 v4 빌드에서 이 줄 때문에 스텝이 실패했다. 이미지는 이미 푸시된 뒤였다)
+          BYTES=$(docker image inspect "$IMG" --format '{{.Size}}')
+          echo "압축 해제 크기: $BYTES 바이트 ($((BYTES / 1048576)) MB)"
+          echo "=============================================="
+
+  # 같은 태그로 덮어쓰면 옛 이미지가 태그 없이 남아 매번 쌓인다.
+  cleanup:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: 태그 없는 옛 이미지 삭제
+        uses: actions/delete-package-versions@v5
+        continue-on-error: true
+        with:
+          package-name: ltx-runpod
+          package-type: container
+          min-versions-to-keep: 1
+          delete-only-untagged-versions: true

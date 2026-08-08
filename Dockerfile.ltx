@@ -1,0 +1,140 @@
+# LTX-2.3 영상 워커 — ComfyUI 런포드 서버리스
+#
+# 모델 가중치는 이 이미지에 넣지 않는다. 워커가 뜰 때 허깅페이스에서 직접 받는다.
+# (크레아2 실측: 초당 800MB. 도커에 구우면 코드 한 줄 고칠 때마다 수십 GB 재빌드다)
+#
+# ⚠️ 런포드 콘솔의 Model(모델 캐싱) 칸은 반드시 비워둔다.
+#
+# 설계: logb/2.3영상워커_설계.md
+# 배선 근거: unsloth 가 mp4 에 심어 배포한 검증 워크플로 (노드 39개 전수 판독)
+
+# ──────────────────────────────────────────────────────────────────────
+# ⚠️ 이 Dockerfile 에 확인문(assert·python -c 검사)을 함부로 덧붙이지 말 것.
+#    크레아2 빌드 실패 3건이 전부 나중에 덧붙인 확인문 하나에서 났다.
+#    (comfy.sd 를 import 하면 GPU 를 잡으러 가서 한 번,
+#     CLIPType 이 IntEnum 이 아닌데 int() 로 감싸서 또 한 번)
+#    정작 워커는 그 확인문이 없을 때 멀쩡히 돌았다.
+# ──────────────────────────────────────────────────────────────────────
+
+# ⭐ 크레아2 와 같은 베이스다. 런포드에서 도는 것이 이미 확인된 조합이다.
+#    cu128 로 가면 안 된다 — 그 인덱스의 torch 2.11 은 GPU 없는 빌드 머신에서
+#    get_arch_list() 가 빈 목록을 돌려줘 sm_120 확인이 불가능하다 (2026-08-04 실패).
+FROM pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime
+
+# ⭐ 전부 고정한다. latest·브랜치 추적 금지 (보스 지시 2026-08-04).
+#
+# ComfyUI v0.29.2 — 크레아2 와 같은 버전.
+#   LTX-2.3 에 필요한 것이 전부 이 태그에 있음을 하나씩 확인했다 (2026-08-08):
+#     LTXAVTextEncoderLoader / LTXVLatentUpsampler / LatentUpscaleModelLoader /
+#     sd_detect / llama_detect / detect_layer_quantization /
+#     CreateVideo / SaveVideo / LTXVConcatAVLatent / 업스케일러 LTX 분기(222행)
+#   v0.29.2 의 sd_detect 코드가 최신(v0.31.0)과 글자까지 같은 것도 확인했다.
+#   → 검증된 환경을 안 바꾸는 쪽이 이득이라고 판단했다.
+ARG COMFYUI_VERSION=v0.29.2
+
+# city96/ComfyUI-GGUF — 본체(UnetLoaderGGUF)와 젬마(DualCLIPLoaderGGUF) 로더.
+#   ⚠️ 크레아2 는 molbal 포크를 쓴다(그쪽만 krea2 를 안다). 영상은 city96 본체다.
+#      loader.py 12행 IMG_ARCH_LIST 에 "ltxv", 13행 TXT_ARCH_LIST 에 "gemma3" 가 있다.
+ARG COMFYUI_GGUF_COMMIT=6ea2651e7df66d7585f6ffee804b20e92fb38b8a
+
+# Lightricks/ComfyUI-LTXVideo — IC-LoRA 노드용.
+#   ⚠️ 기본 생성에는 필요 없다(unsloth 검증 배선은 코어 노드만 쓴다).
+#      Ingredients(캐릭터 일관성)가 IC-LoRA 라 나중에 필요해서 미리 넣어둔다.
+ARG COMFYUI_LTXVIDEO_COMMIT=3b9c5cde4700917074823d45e25401d81049f8fc
+
+# ⚠️ kijai/ComfyUI-KJNodes 는 일부러 뺐다.
+#    unsloth 워크플로가 VAELoaderKJ 를 쓰지만, 같은 파일을 코어 노드가 읽는 것을
+#    키로 확인했다 (audio_vae./vocoder. 접두사, decoder.up_blocks... 감지키).
+#    KJNodes 는 __init__.py 에서 모든 노드를 한꺼번에 import 해서
+#    mss(화면 캡처)·matplotlib·opencv 를 전부 깔아야 하고,
+#    그중 하나만 실패해도 노드 전체가 죽는다. 빌드 위험을 줄이는 쪽을 골랐다.
+#    필요해지면 그때 추가한다.
+
+# ⚠️ hf_transfer 는 이제 아무 일도 안 한다 (2026-08-04 로그로 확인).
+#    huggingface_hub 가 "use HF_XET_HIGH_PERFORMANCE instead" 라고 경고한다.
+#    크레아2 의 초당 800MB 는 hf_transfer 가 아니라 Xet 이 낸 속도였다.
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_INPUT=1 \
+    HF_XET_HIGH_PERFORMANCE=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    COMFYUI_PORT=8188
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git \
+      ca-certificates \
+      libgl1 \
+      libglib2.0-0 \
+      ffmpeg \
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+# ⭐ ffmpeg 를 추가했다. 크레아2 에는 없던 것이다.
+#    영상 저장(CreateVideo → SaveVideo, format=mp4, codec=auto)에 필요하다.
+
+# ComfyUI 본체 — 태그로 고정
+RUN git clone --depth 1 --branch ${COMFYUI_VERSION} \
+      https://github.com/Comfy-Org/ComfyUI /comfyui
+# ⚠️ 저장소가 comfyanonymous/ComfyUI → Comfy-Org/ComfyUI 로 옮겨졌다 (2026-08-08 확인).
+#    옛 주소도 리다이렉트로 동작하지만 새 주소를 쓴다.
+
+# ⚠️ transformers / huggingface-hub 를 여기서 못박는다.
+#    ComfyUI 는 상한을 안 걸어놔서 새로 깔면 5.x / 1.x 가 딸려와 시작할 때 죽는다.
+#    (런포드 공식 Dockerfile 에도 같은 주석과 같은 핀이 있다)
+RUN python -m pip install --no-cache-dir --break-system-packages \
+      -r /comfyui/requirements.txt \
+ && python -m pip install --no-cache-dir --break-system-packages \
+      "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+
+# handler 가 쓰는 것 + GGUF 노드가 요구하는 것
+#   runpod        서버리스 진입점
+#   requests      ComfyUI HTTP API 호출
+#   hf_xet        대용량 다운로드 가속
+#   gguf          city96 노드가 요구
+#   sentencepiece protobuf   city96 requirements. 젬마 토크나이저에 쓰인다
+RUN python -m pip install --no-cache-dir --break-system-packages \
+      runpod requests hf_xet hf_transfer \
+      "gguf>=0.13.0" sentencepiece protobuf
+
+# ── 커스텀 노드 ───────────────────────────────────────────────────────
+RUN git clone https://github.com/city96/ComfyUI-GGUF \
+      /comfyui/custom_nodes/ComfyUI-GGUF \
+    && git -C /comfyui/custom_nodes/ComfyUI-GGUF checkout ${COMFYUI_GGUF_COMMIT} \
+    && git -C /comfyui/custom_nodes/ComfyUI-GGUF rev-parse HEAD
+
+RUN git clone https://github.com/Lightricks/ComfyUI-LTXVideo \
+      /comfyui/custom_nodes/ComfyUI-LTXVideo \
+    && git -C /comfyui/custom_nodes/ComfyUI-LTXVideo checkout ${COMFYUI_LTXVIDEO_COMMIT} \
+    && git -C /comfyui/custom_nodes/ComfyUI-LTXVideo rev-parse HEAD
+
+# LTXVideo 가 요구하는 것: diffusers einops huggingface_hub kornia ninja transformers[timm]
+# ⚠️ transformers[timm] 이 transformers 를 올려버릴 수 있어서, 설치 뒤 핀을 다시 건다.
+RUN python -m pip install --no-cache-dir --break-system-packages \
+      -r /comfyui/custom_nodes/ComfyUI-LTXVideo/requirements.txt \
+ && python -m pip install --no-cache-dir --break-system-packages \
+      "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+
+# 모델이 들어갈 폴더를 미리 만든다. 워커가 여기에 받아 놓는다.
+#   unet                   본체 GGUF          (UnetLoaderGGUF)
+#   text_encoders          젬마 + 커넥터       (DualCLIPLoaderGGUF)
+#   vae                    영상 VAE           (코어 VAELoader)
+#   checkpoints            오디오 VAE          (코어 LTXVAudioVAELoader 가 여기를 본다)
+#   latent_upscale_models  공간·시간 업스케일러 (LatentUpscaleModelLoader)
+#   loras                  로라
+RUN mkdir -p /comfyui/models/unet \
+             /comfyui/models/text_encoders \
+             /comfyui/models/vae \
+             /comfyui/models/checkpoints \
+             /comfyui/models/latent_upscale_models \
+             /comfyui/models/loras
+
+# ⭐ ComfyUI 를 실제로 한 번 띄워본다(CPU). 노드 그래프를 전부 import 하므로
+#    커스텀 노드가 깨졌거나 의존성이 어긋났으면 여기서 잡힌다.
+#    런타임에 "server not reachable" 로 나타나면 원인을 못 찾는다.
+#    ⚠️ 크레아2 v4 에서 통과가 확인된 방식이다. 여기에 뭘 더 붙이지 말 것.
+RUN cd /comfyui && timeout 900 python main.py --quick-test-for-ci --cpu
+
+COPY ltx_core.py /ltx_core.py
+COPY handler_ltx.py /handler_ltx.py
+
+# ⭐ 문법 검사. 이 PC 에는 파이썬이 없어서 로컬에서 못 돌린다.
+RUN python -m py_compile /ltx_core.py /handler_ltx.py && echo "handler 문법 OK"
+
+CMD ["python", "-u", "/handler_ltx.py"]
