@@ -673,8 +673,33 @@ def build_workflow(p):
         wf["31"] = {"class_type": "LTXVLatentUpsampler",
                     "inputs": {"samples": ["26", 2],
                                "upscale_model": ["30", 0], "vae": ["2", 0]}}
+        # ⭐ 2단계에도 사진 조건을 다시 건다 (i2v 일 때만)
+        #
+        # ⚠️ 왜 필요한가 — 2026-08-09 실측으로 밝혀진 것
+        #    사진 조건은 잠재에 noise_mask 형태로 붙는데, 업스케일("31")로 잠재를
+        #    2배로 키우는 순간 그 마스크가 사라진다. 그래서 2단계 정제가 글자만 보고
+        #    얼굴을 새로 그렸다.
+        #    실증: 같은 사진·프롬프트·시드로 업스케일만 껐더니 원본 인물이 그대로
+        #          유지됐고, 켜면 다른 사람이 나왔다.
+        #
+        # 노드가 업스케일된 잠재를 받을 수 있는 근거 (latents.py 536~558행 확인):
+        #    batch, channels, frames, height, width = shape   ← 들어온 잠재 크기를 읽고
+        #    if image.shape[1] != height ...: common_upscale(...)  ← 사진을 거기 맞춘다
+        #    → 1단계 잠재든 업스케일된 잠재든 알아서 맞춘다
+        #
+        # ⚠️ 노드 번호 72 는 비어 있음을 확인했다
+        #    (사용 중: 1~6, 10~13, 20~26, 30~32, 40~45, 50~53, 60~69 로라, 70~71)
+        up_ref = ["31", 0]
+        if p["mode"] == "i2v":
+            wf["72"] = {"class_type": "LTXVImgToVideoConditionOnly",
+                        "inputs": {"vae": ["2", 0],
+                                   "image": ["70", 0],
+                                   "latent": ["31", 0],
+                                   "strength": p["image_strength"]}}
+            up_ref = ["72", 0]
+
         wf["32"] = {"class_type": "LTXVConcatAVLatent",
-                    "inputs": {"video_latent": ["31", 0],
+                    "inputs": {"video_latent": up_ref,
                                "audio_latent": ["25", 1]}}
         wf["40"] = {"class_type": "RandomNoise",
                     "inputs": {"noise_seed": p["seed"]}}
