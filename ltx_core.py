@@ -35,6 +35,34 @@ from huggingface_hub import hf_hub_download
 COMFY_HOST = "127.0.0.1"
 COMFY_PORT = int(os.environ.get("COMFYUI_PORT", "8188"))
 COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
+
+# ComfyUI 가 사진·영상·소리를 읽어가는 폴더.
+# 워커와 ComfyUI 가 같은 컨테이너 안에 있으므로 파일로 직접 놓으면 된다
+# (HTTP 업로드 /upload/image 를 쓸 필요가 없다).
+COMFY_INPUT_DIR = os.environ.get("COMFYUI_INPUT_DIR", "/comfyui/input")
+
+# ⭐ 노드 결과 캐시 방식. 기본을 none 으로 둔 이유는 두 가지다.
+#
+# ① RAM 이 터진다
+#    ComfyUI 는 컨테이너 제한을 모르고 호스트 전체 RAM 을 기준으로 캐시를 쟁여둔다.
+#    2026-08-09 실측: 워커가 "total RAM 515597 MB"(503GB, 호스트 전체)로 인식했는데
+#    컨테이너 몫은 46.57GiB 뿐이었고, RAM 이 99% 까지 찼다.
+#    ComfyUI 기본값이 "inactive = 시스템 RAM 의 100%(최대 128GB)" 라서
+#    128GB 까지 써도 된다고 믿고 계속 쌓는다. 46.57GB 에서 컨테이너가 죽인다.
+#    (ComfyUI Issue #7465 — 런포드 서버리스에서 같은 증상이 보고됨)
+#
+# ② 측정이 오염된다
+#    같은 조건을 두 번 던지면 두 번째는 계산을 건너뛰어 가짜로 빠른 기록이 나온다.
+#    2026-08-09 에 LTX_03 이 19.1초로 찍혔다가 무효 처리된 것이 이것 때문이다.
+#
+# 값 형식 (템플릿에서 바꾸면 재빌드 없이 되돌릴 수 있다)
+#   none        --cache-none          (기본)
+#   ram         --cache-ram           ComfyUI 기본 임계값
+#   ram:8,32    --cache-ram 8 32      남겨둘 여유를 GB 로 지정 (headroom 이다. 쓸 양이 아니다)
+#   classic     --cache-classic
+#   lru:10      --cache-lru 10
+#   default     아무 옵션도 주지 않는다
+COMFY_CACHE_MODE = os.environ.get("COMFY_CACHE_MODE", "none").strip().lower()
 MODELS_DIR = os.environ.get("COMFYUI_MODELS_DIR", "/comfyui/models")
 
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_ACCESS_TOKEN")
@@ -402,6 +430,31 @@ def download_base_models():
 # 2) ComfyUI 띄우기
 # ──────────────────────────────────────────────────────────────────────
 
+def cache_args():
+    """COMFY_CACHE_MODE 를 ComfyUI 명령줄 옵션으로 바꾼다.
+
+    ⚠️ 모르는 값이 오면 조용히 넘기지 않고 경고를 찍은 뒤 기본(none)으로 간다.
+       오타 하나 때문에 RAM 이 터지는 것을 로그에서 바로 알아채기 위해서다.
+    """
+    m = COMFY_CACHE_MODE
+    if m in ("", "default"):
+        return []
+    if m == "none":
+        return ["--cache-none"]
+    if m == "classic":
+        return ["--cache-classic"]
+    if m == "ram":
+        return ["--cache-ram"]
+    if m.startswith("ram:"):
+        # ram:8  또는  ram:8,32   (앞이 active, 뒤가 inactive/pin 임계값. 단위 GB)
+        vals = [v.strip() for v in m[4:].split(",") if v.strip()]
+        return ["--cache-ram"] + vals
+    if m.startswith("lru:"):
+        return ["--cache-lru", m[4:].strip()]
+    log(f"[comfyui] ⚠️ COMFY_CACHE_MODE='{m}' 를 모르겠다. 기본값 none 으로 간다.")
+    return ["--cache-none"]
+
+
 def start_comfyui():
     cmd = [
         sys.executable, "-u", "/comfyui/main.py",
@@ -411,7 +464,7 @@ def start_comfyui():
         "--disable-metadata",
         "--disable-api-nodes",
         "--log-stdout",
-    ]
+    ] + cache_args()
     log(f"[comfyui] 실행: {' '.join(cmd)}")
     return subprocess.Popen(cmd, cwd="/comfyui")
 
@@ -560,8 +613,33 @@ def build_workflow(p):
     wf["11"] = {"class_type": "EmptyLTXVLatentVideo",
                 "inputs": {"width": w1, "height": h1,
                            "length": p["frames"], "batch_size": 1}}
+    # ── 사진 → 영상 (i2v) ─────────────────────────────────────────
+    # 빈 잠재("11")에 사진을 얹어 첫 프레임을 고정한다.
+    #
+    # 노드 규격은 실물로 확인했다 (지어낸 이름이 아니다):
+    #   LoadImage                     코어 nodes.py 1721행
+    #     입력 image=<파일 이름>  /  출력 0=IMAGE, 1=MASK
+    #   LTXVImgToVideoConditionOnly   ComfyUI-LTXVideo latents.py 499행
+    #     입력 vae / image / latent / strength(0~1)  /  출력 LATENT
+    #     ⚠️ 이 노드는 v2 부터 쓸 수 있다. v1 에서는 kornia 오류로
+    #        ComfyUI-LTXVideo 묶음이 통째로 import 실패였다.
+    #
+    # 사진 크기는 노드가 알아서 잠재 크기에 맞춘다("Automatically resizes image").
+    # 그래서 업스케일을 켜서 1단계가 절반 해상도가 되어도 따로 손댈 것이 없다.
+    video_latent_ref = ["11", 0]
+    if p["mode"] == "i2v":
+        wf["70"] = {"class_type": "LoadImage",
+                    "inputs": {"image": p["image"]}}
+        wf["71"] = {"class_type": "LTXVImgToVideoConditionOnly",
+                    "inputs": {"vae": ["2", 0],
+                               "image": ["70", 0],
+                               "latent": ["11", 0],
+                               "strength": p["image_strength"]}}
+        video_latent_ref = ["71", 0]
+
     wf["12"] = {"class_type": "LTXVConcatAVLatent",
-                "inputs": {"video_latent": ["11", 0], "audio_latent": ["10", 0]}}
+                "inputs": {"video_latent": video_latent_ref,
+                           "audio_latent": ["10", 0]}}
 
     # ── 1단계 샘플링 ──────────────────────────────────────────────
     wf["20"] = {"class_type": "RandomNoise",
@@ -714,6 +792,56 @@ def fetch_video(entry):
 # 5) 요청 해석
 # ──────────────────────────────────────────────────────────────────────
 
+def save_media(job):
+    """요청에 실려온 사진·영상·소리를 ComfyUI 가 읽는 폴더에 파일로 놓는다.
+
+    ⭐ 이 함수 하나가 image- / video- / audio- 로 시작하는 기능 전부의 전제조건이다.
+       LTX-2.3 은 11가지 입출력 조합을 지원하는데, 그중 9가지가 "재료를 넣는" 것이라
+       재료를 넣을 통로가 없으면 배선을 아무리 잘 그려도 쓸 수 없다.
+
+    요청 형식:
+      "media": [{"name": "first.png", "data": "(base64)"}, ...]
+
+    워커와 ComfyUI 가 같은 컨테이너 안에 있으므로 파일로 직접 놓으면 된다.
+    배선에서는 LoadImage 등에 파일 이름만 적으면 그대로 읽힌다.
+
+    반환: (놓인 파일 이름 목록, 오류메시지)
+    """
+    items = job.get("media")
+    if not items:
+        return [], None
+    if not isinstance(items, list):
+        return None, "media 는 목록이어야 한다."
+
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+    saved = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            return None, f"media[{i}] 가 잘못됐다: {item!r}"
+        raw_name = str(item.get("name") or "").strip()
+        data = item.get("data")
+        if not raw_name or not data:
+            return None, f"media[{i}] 에 name 또는 data 가 없다."
+
+        # ⚠️ 경로 탈출 방지. "../../etc/passwd" 같은 이름이 와도 파일명만 남긴다.
+        name = os.path.basename(raw_name)
+        if not name or name in (".", ".."):
+            return None, f"media[{i}] 의 name 이 파일 이름이 아니다: {raw_name!r}"
+
+        try:
+            blob = base64.b64decode(data, validate=True)
+        except Exception as e:
+            return None, f"media[{i}]({name}) 의 data 가 base64 가 아니다: {e}"
+
+        path = os.path.join(COMFY_INPUT_DIR, name)
+        with open(path, "wb") as f:
+            f.write(blob)
+        log(f"[media] 저장 {name} ({len(blob)/1048576:.2f} MB) → {path}")
+        saved.append(name)
+
+    return saved, None
+
+
 def resolve_loras(job):
     """요청의 loras 목록을 카탈로그와 맞추고, 없으면 그때 받는다.
 
@@ -787,7 +915,20 @@ def parse_params(job):
     else:
         upscale_spatial = DEF_UPSCALE_SPATIAL
 
+    # ⭐ 어떤 배선을 그릴지. 안 적으면 image 가 있는지로 알아서 고른다.
+    #    t2v  글자 → 영상        (기본)
+    #    i2v  사진 → 영상        첫 프레임을 사진으로 고정한다
+    #    그 밖의 조합은 workflow 를 통째로 던지는 길로 쓴다 (generate 참고)
+    image = str(job.get("image") or "").strip()
+    mode = str(job.get("mode") or "").strip().lower()
+    if not mode:
+        mode = "i2v" if image else "t2v"
+
     return {
+        "mode": mode,
+        "image": os.path.basename(image) if image else "",
+        # 1.0 이면 첫 프레임을 사진 그대로 고정, 낮추면 사진에서 더 자유로워진다
+        "image_strength": float(job.get("image_strength", 1.0)),
         "prompt": str(job.get("prompt") or "").strip(),
         "negative": str(job.get("negative_prompt", DEF_NEGATIVE)),
         "width": int(job.get("width", DEF_WIDTH)),
@@ -861,9 +1002,40 @@ def capabilities():
             }
             for c in LORA_CATALOG
         ],
+        # ⭐ 어떤 방식으로 시킬 수 있는지. UI 는 이 목록으로 탭이나 버튼을 만들면 된다.
+        "modes": [
+            {"id": "t2v", "label": "글자 → 영상", "needs": [],
+             "note": "기본값. image 를 안 주면 이걸로 간다"},
+            {"id": "i2v", "label": "사진 → 영상", "needs": ["image"],
+             "note": "첫 프레임을 사진으로 고정한다. media 로 사진을 함께 보내야 한다"},
+        ],
+        # ⭐ 재료 넣는 통로. 이것이 있어야 사진·영상·소리를 쓰는 기능들이 열린다.
+        "media": {
+            "how": "요청에 media 를 실으면 워커가 컨테이너 안 입력 폴더에 파일로 놓는다",
+            "format": [{"name": "파일 이름 (예: first.png)", "data": "base64 문자열"}],
+            "then": "놓은 뒤 image 에 그 파일 이름을 적거나, workflow 의 노드에서 그 이름으로 부른다",
+            "dir": COMFY_INPUT_DIR,
+        },
+        # ⭐ 위 두 가지로 안 되는 조합은 배선을 통째로 던지면 된다.
+        "workflow_passthrough": {
+            "how": "ComfyUI API 형식 JSON 을 workflow 에 통째로 넣으면 그대로 실행한다",
+            "note": "media 와 함께 쓰면 모델이 지원하는 입출력 조합을 전부 쓸 수 있다. "
+                    "코드를 고치거나 도커를 다시 만들 필요가 없다",
+            "model_supports": [
+                "text-to-video", "image-to-video", "video-to-video",
+                "image-text-to-video", "audio-to-video", "text-to-audio",
+                "video-to-audio", "audio-to-audio", "text-to-audio-video",
+                "image-to-audio-video", "image-text-to-audio-video",
+            ],
+        },
         "return": {"mode": RETURN_MODE, "max_mb": MAX_RETURN_MB},
+        "cache": {"mode": COMFY_CACHE_MODE, "args": cache_args(),
+                  "note": "환경변수 COMFY_CACHE_MODE 로 바꾼다. 기본 none — "
+                          "컨테이너 RAM 이 터지는 것과 같은 조건 재실행이 "
+                          "가짜로 빨라지는 것을 둘 다 막는다"},
         "notes": [
-            "IC-LoRA(참고 영상·사진이 필요한 것)는 아직 지원하지 않는다",
+            "IC-LoRA(참고 영상·사진이 필요한 것)는 아직 배선이 없다. "
+            "노드는 v2 부터 쓸 수 있다 (LTXICLoRALoaderModelOnly / LTXAddVideoICLoRAGuide)",
             "해상도·프레임 기본값은 실측 전 잠정값이다",
         ],
     }
@@ -897,6 +1069,12 @@ def generate(job):
     if str(job.get("action", "")).lower() == "capabilities":
         return capabilities()
 
+    # ⭐ 재료(사진·영상·소리)를 먼저 컨테이너 안에 놓는다.
+    #    workflow 를 통째로 던질 때도 필요하므로 분기 앞에서 처리한다.
+    saved, err = save_media(job)
+    if err:
+        return {"error": err}
+
     # 워크플로 통째로 던지기 (공식 ComfyUI 화면에서 만든 것을 그대로 실행)
     raw_wf = job.get("workflow")
 
@@ -904,6 +1082,19 @@ def generate(job):
         p = parse_params(job)
         if not p["prompt"]:
             return {"error": "prompt 가 비어 있다."}
+
+        # ⚠️ 사진이 없는데 i2v 로 돌면 ComfyUI 가 엉뚱한 오류를 내거나
+        #    조용히 다른 그림을 그린다. 여기서 막아 원인을 분명히 한다.
+        if p["mode"] == "i2v" and not p["image"]:
+            return {"error": "mode 가 i2v 인데 image 가 없다. "
+                             "media 로 사진을 보내고 image 에 그 파일 이름을 적어라."}
+        if p["image"]:
+            here = os.path.join(COMFY_INPUT_DIR, p["image"])
+            if p["image"] not in saved and not os.path.exists(here):
+                return {"error": f"image '{p['image']}' 를 찾을 수 없다. "
+                                 f"media 에 같이 실어 보냈는지 확인해라. "
+                                 f"이번 요청에 실려온 것: {saved or '없음'}"}
+
         loras, err = resolve_loras(job)
         if err:
             return {"error": err}
@@ -922,7 +1113,9 @@ def generate(job):
         prompt_id = queue_workflow(wf)
         if p is not None:
             desc = ", ".join(f"{s['name']}@{s['strength']}" for s in p["loras"]) or "없음"
-            log(f"[job] 큐 등록 {prompt_id} — {p['width']}x{p['height']} "
+            src = f" 사진={p['image']}@{p['image_strength']}" if p["mode"] == "i2v" else ""
+            log(f"[job] 큐 등록 {prompt_id} — [{p['mode']}]{src} "
+                f"{p['width']}x{p['height']} "
                 f"{p['frames']}프레임 {p['fps']}fps {p['steps']}스텝 cfg{p['cfg']} "
                 f"seed{p['seed']} 업스케일={p['upscale_spatial']} 소리={p['audio']} "
                 f"로라=[{desc}]{' 순정' if p['stock'] else ''}")
@@ -955,6 +1148,11 @@ def generate(job):
 
     if p is not None:
         result.update({
+            # ⭐ 어떤 배선으로 돌았는지. 사진이 실제로 물렸는지 확인하는 단서다.
+            #    로라와 같은 이유로 넣는다 — 사진이 안 물려도 영상은 나오기 때문이다.
+            "mode": p["mode"],
+            "image": p["image"] or None,
+            "image_strength": p["image_strength"] if p["mode"] == "i2v" else None,
             "width": p["width"], "height": p["height"],
             "frames": p["frames"], "fps": p["fps"],
             "steps": p["steps"], "cfg": p["cfg"],
