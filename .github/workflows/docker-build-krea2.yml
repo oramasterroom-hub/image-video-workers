@@ -81,7 +81,12 @@ env:
   #       파일이 없어 ComfyUI 가 실패했다. 스타일 전이가 여기서 막혀 있었다.
   #    ⚠️ 배선 자체는 손대지 않는다. 파일만 내려받는다. loras 를 안 적으면 아무것도 안 받는다.
   #       따라서 v9 의 기존 동작(회귀 검증 기준)은 그대로다.
-  IMAGE_TAG: v10
+  # ⭐ v11 (2026-08-12): 비율 + 해상도로 크기 지정 (aspect / resolution)
+  #    크레아 공식 API 와 같은 방식 — aspect_ratio 8종 + resolution "1K"
+  #    K 는 정사각형 한 변의 길이. 1K=1.0MP(1024²) / 1.5K=2.25MP / 2K=4.0MP(2048²)
+  #    ⚠️ 터보 상한은 2K. 공식 가이드 "can generate up to 2k resolution images"
+  #    ⚠️ width/height 를 직접 주면 그게 이긴다. 기존 요청은 동작이 안 바뀐다
+  IMAGE_TAG: v11
 
 jobs:
   build:

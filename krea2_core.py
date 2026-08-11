@@ -21,6 +21,7 @@ v7·v8 기능은 그대로 살아 있다
 
 import base64
 import json
+import math
 import os
 import random
 import subprocess
@@ -645,6 +646,90 @@ def fetch_images(entry):
 # 5) 요청 처리
 # ──────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────
+# ⭐ v11: 비율 + 해상도로 크기 정하기
+#
+# 크레아 공식 API 가 이 방식이다 (krea.ai/docs/developers/krea-2/overview 원문)
+#   aspect_ratio  One of 1:1, 4:3, 3:2, 16:9, 2.35:1, 4:5, 2:3, 9:16
+#   resolution    Currently only 1K is supported
+#
+# K 는 정사각형일 때 한 변의 길이다. 넓이는 그 제곱이다.
+#   1K = 1.0 MP (1024x1024)  /  1.5K = 2.25 MP  /  2K = 4.0 MP (2048x2048)
+# ⚠️ 터보 모델의 상한은 2K 다. 공식 가이드 원문 "can generate up to 2k resolution images".
+#    그 위도 물리적으로는 돌지만(2K 에서 VRAM 16.9GB, 여유 6.6GB) 학습 범위 밖이라 막는다.
+# ⚠️ 계산식은 ComfyUI ResolutionSelector(comfy_extras/nodes_resolution.py)와 같다.
+#    8의 배수로 맞춘다. 안 맞으면 ComfyUI 가 알아서 자르는데 그때 비율이 틀어진다.
+# ──────────────────────────────────────────────────────────────────────
+
+ASPECT_RATIOS = {
+    "1:1": (1, 1), "4:3": (4, 3), "3:2": (3, 2), "16:9": (16, 9),
+    "2.35:1": (235, 100), "4:5": (4, 5), "2:3": (2, 3), "9:16": (9, 16),
+    # 세로 짝도 받아준다. 공식 목록에는 없지만 막을 이유가 없다
+    "3:4": (3, 4), "1:2.35": (100, 235),
+}
+
+RESOLUTIONS = {"1k": 1.0, "1.5k": 2.25, "2k": 4.0}
+
+
+def calc_size(aspect, megapixels, multiple=8):
+    """비율과 메가픽셀로 픽셀 크기를 만든다. ComfyUI ResolutionSelector 와 같은 식."""
+    wr, hr = ASPECT_RATIOS[aspect]
+    scale = math.sqrt(megapixels * 1024 * 1024 / (wr * hr))
+    w = round(wr * scale / multiple) * multiple
+    h = round(hr * scale / multiple) * multiple
+    return w, h
+
+
+def resolve_size(job):
+    """요청에서 최종 width/height 를 정한다. 반환 (width, height, 오류메시지).
+
+    우선순위
+      1) width/height 를 직접 준 경우 — 그대로 쓴다 (기존 방식. 회귀 기준을 지키려면 필수)
+      2) aspect 를 준 경우 — resolution(기본 1K)과 함께 계산한다
+      3) 아무것도 없으면 — 환경변수 기본값
+    """
+    has_wh = job.get("width") is not None or job.get("height") is not None
+    aspect = job.get("aspect") or job.get("aspect_ratio")
+
+    if has_wh:
+        # ⚠️ 둘을 같이 주면 픽셀이 이긴다. 조용히 무시하지 않고 아래 로그로 알린다.
+        if aspect:
+            log(f"[size] ⚠️ width/height 와 aspect 가 같이 왔다. 픽셀을 쓴다 (aspect={aspect} 무시)")
+        return (int(job.get("width", DEFAULT_WIDTH)),
+                int(job.get("height", DEFAULT_HEIGHT)), None)
+
+    if not aspect:
+        return DEFAULT_WIDTH, DEFAULT_HEIGHT, None
+
+    key = str(aspect).strip().lower().replace(" ", "")
+    if key not in ASPECT_RATIOS:
+        return None, None, (f"aspect '{aspect}' 를 모른다. "
+                            f"쓸 수 있는 것: {', '.join(ASPECT_RATIOS)}")
+
+    raw_res = str(job.get("resolution") or "1K").strip().lower()
+    if raw_res in RESOLUTIONS:
+        mp = RESOLUTIONS[raw_res]
+    else:
+        # 숫자를 직접 준 경우 — "2.5" 나 2.5 를 메가픽셀로 받는다
+        try:
+            mp = float(raw_res.rstrip("kK") or 0)
+            if raw_res.endswith("k"):
+                mp = mp * mp            # 1.5K -> 2.25MP. K 는 한 변이라 제곱이다
+        except ValueError:
+            return None, None, (f"resolution '{job.get('resolution')}' 를 모른다. "
+                                f"쓸 수 있는 것: 1K, 1.5K, 2K")
+    if mp <= 0:
+        return None, None, "resolution 이 0 이하다."
+    if mp > 4.0:
+        return None, None, ("2K(4.0MP)가 터보의 상한이다. 공식 가이드 "
+                            "'up to 2k resolution images'. 더 키우려면 "
+                            "width/height 로 직접 지정할 것")
+
+    w, h = calc_size(key, mp)
+    log(f"[size] aspect={key} resolution={raw_res} ({mp}MP) -> {w}x{h}")
+    return w, h, None
+
+
 def save_media(job):
     """요청에 실려온 사진을 ComfyUI 가 읽는 폴더에 파일로 놓는다. (v9)
 
@@ -794,6 +879,14 @@ def capabilities():
             "text_encoder": f"{TE_REPO}/{TE_FILE}", "vae": f"{VAE_REPO}/{VAE_FILE}",
         },
         "features": [
+            # ⭐ v11: 사람이 고르는 방식. 크레아 공식 API 와 같은 형태다
+            {"id": "aspect", "label": "비율", "type": "combo",
+             "options": list(ASPECT_RATIOS), "default": None,
+             "note": "width/height 를 같이 주면 픽셀이 이긴다"},
+            {"id": "resolution", "label": "해상도", "type": "combo",
+             "options": ["1K", "1.5K", "2K"], "default": "1K",
+             "note": "1K=1.0MP(1024²) · 1.5K=2.25MP · 2K=4.0MP(2048²). "
+                     "터보 상한은 2K (공식 'up to 2k')"},
             {"id": "width", "label": "가로", "type": "int", "default": DEFAULT_WIDTH},
             {"id": "height", "label": "세로", "type": "int", "default": DEFAULT_HEIGHT},
             {"id": "steps", "label": "스텝", "type": "int", "default": DEFAULT_STEPS,
@@ -896,11 +989,16 @@ def generate(job):
         if err:
             return {"error": err}
 
+        # ⭐ v11: 비율 + 해상도로 크기를 정한다. width/height 를 직접 주면 그게 이긴다.
+        req_w, req_h, err = resolve_size(job)
+        if err:
+            return {"error": err}
+
         p = {
             "prompt": str(prompt),
             "negative": str(job.get("negative_prompt") or ""),
-            "width": int(job.get("width", DEFAULT_WIDTH)),
-            "height": int(job.get("height", DEFAULT_HEIGHT)),
+            "width": req_w,
+            "height": req_h,
             "steps": int(job.get("steps", DEFAULT_STEPS)),
             "cfg": float(job.get("cfg", DEFAULT_CFG)),
             "sampler": str(job.get("sampler", DEFAULT_SAMPLER)),
