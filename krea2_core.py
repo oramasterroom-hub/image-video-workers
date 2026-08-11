@@ -870,9 +870,21 @@ def generate(job):
 
     # ⭐ v9: 워크플로 통째로 던지기
     raw_wf = job.get("workflow")
+    wf_loras = []
     if raw_wf is not None:
         if not isinstance(raw_wf, dict):
             return {"error": "workflow 는 ComfyUI API 형식 JSON 이어야 한다."}
+        # ⭐ v10: 배선을 통째로 던질 때도 로라를 미리 받아둔다.
+        #    ⚠️ 배선은 손대지 않는다. 파일을 컨테이너에 내려놓기만 하고,
+        #       어느 노드에 어떤 강도로 걸지는 배선의 lora_name 이 정한다.
+        #    ⚠️ v9 은 이 분기가 resolve_loras 를 건너뛰었다. 그래서 배선에 로라를 적어도
+        #       파일이 없어 ComfyUI 가 실패했다. 스타일 전이가 정확히 여기서 막혔다.
+        #    ⚠️ loras 를 안 적으면 아무것도 받지 않는다. 여기서 resolve_loras 를 무조건
+        #       부르면 요청에 없어도 템플릿 로라(체형)를 받아버린다. 그건 배선과 무관하다.
+        if job.get("loras") is not None:
+            wf_loras, err = resolve_loras(job)
+            if err:
+                return {"error": err}
         wf = raw_wf
         p = None
     else:
@@ -922,7 +934,9 @@ def generate(job):
                 f"start_step={p['start_step']} sampler={p['sampler']} "
                 f"장수={p['num_images']}{f' 사진={saved}' if saved else ''}")
         else:
+            wf_desc = ", ".join(os.path.basename(s["file"]) for s in wf_loras) or "없음"
             log(f"[job] 큐 등록 {prompt_id} — workflow 통째로 받음 (노드 {len(wf)}개)"
+                f" 미리받은로라=[{wf_desc}]"
                 f"{f' 사진={saved}' if saved else ''}")
         entry = wait_for_result(prompt_id, COMFY_PROC)
         images = fetch_images(entry)
@@ -983,6 +997,12 @@ def generate(job):
         })
     else:
         result["workflow_passthrough"] = True
+        # ⭐ v10: 배선 모드에서 어떤 로라 파일을 미리 받아뒀는지.
+        #    ⚠️ "받아놨다"는 뜻이지 "걸렸다"는 뜻이 아니다. 실제로 걸렸는지는 배선이 정한다.
+        result["loras_downloaded"] = [
+            {"file": os.path.basename(s["file"]), "repo": s.get("repo", "")}
+            for s in wf_loras
+        ] or None
 
     if _boot_stats:
         result["boot"] = dict(_boot_stats)
