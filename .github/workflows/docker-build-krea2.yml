@@ -6,6 +6,7 @@ on:
     paths:
       - "Dockerfile.krea2"
       - "handler_krea2.py"
+      - "krea2_core.py"
       - ".github/workflows/docker-build-krea2.yml"
   workflow_dispatch:
 
@@ -70,7 +71,11 @@ env:
   #       프롬프트·cfg·강도·스텝으로는 통제가 안 돼서 LoRA 파일 자체를 거르는 방향으로 갔다.
   #   ⚠️ "txtfusion 이 원인"은 추정이다. 그래서 무엇을 뺄지 고를 수 있게 만들었다.
   #   ⚠️ 기존 코드는 한 줄도 안 고쳤다(75줄 추가, 0줄 삭제). 검사문도 안 붙였다.
-  IMAGE_TAG: v8
+  # ⭐ v9 (2026-08-11): 껍데기·몸통 분리 + 로라 카탈로그 + 주소로 직접 부르기
+  #    + capabilities + workflow 통째로 던지기 + stock(순정)
+  #    v7·v8 기능(스텝 분기 / LORA_SKIP_KEYS)은 그대로 살아 있다.
+  #    ⚠️ 요청에 loras 를 안 보내면 v8 과 똑같이 동작해야 한다. 그게 회귀 검증 기준이다.
+  IMAGE_TAG: v9
 
 jobs:
   build:

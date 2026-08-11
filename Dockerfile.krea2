@@ -135,9 +135,15 @@ import hf_xet; print('hf_xet OK — Xet 고속 전송 사용 가능')"
 #    안 변하는 것을 빌드할 때마다 다시 확인하고 있었던 것이다. 그래서 뺐다.
 RUN cd /comfyui && timeout 600 python main.py --quick-test-for-ci --cpu
 
+# ⭐ v9 (2026-08-11): 몸통과 껍데기를 갈랐다.
+#    krea2_core.py  몸통. 런포드를 모른다. 나중에 로컬로 옮길 때 이것만 가져간다
+#    handler_krea2.py  껍데기. 런포드 진입점
+#    ⚠️ 둘 다 복사해야 한다. 몸통이 없으면 import 에서 바로 죽는다.
+COPY krea2_core.py /krea2_core.py
 COPY handler_krea2.py /handler_krea2.py
 
-# ⭐ handler 문법 검사. 이 PC 에는 파이썬이 없어서 로컬에서 못 돌린다.
+# ⭐ 문법 검사. 여기서 걸리면 빌드가 실패해서 잘못된 이미지가 안 나간다.
+RUN python -m py_compile /krea2_core.py && echo "core 문법 OK"
 RUN python -m py_compile /handler_krea2.py && echo "handler 문법 OK"
 
 CMD ["python", "-u", "/handler_krea2.py"]
