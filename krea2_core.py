@@ -41,6 +41,8 @@ COMFY_HOST = "127.0.0.1"
 COMFY_PORT = int(os.environ.get("COMFYUI_PORT", "8188"))
 COMFY_URL = f"http://{COMFY_HOST}:{COMFY_PORT}"
 MODELS_DIR = "/comfyui/models"
+# 요청에 실려온 사진이 놓이는 곳. ComfyUI 의 LoadImage 가 여기를 본다.
+COMFY_INPUT_DIR = os.environ.get("COMFYUI_INPUT_DIR", "/comfyui/input")
 
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_ACCESS_TOKEN")
 
@@ -463,7 +465,7 @@ class VramWatcher(threading.Thread):
 # ──────────────────────────────────────────────────────────────────────
 
 def build_workflow(prompt, negative, width, height, steps, cfg, seed,
-                   loras, start_step, sampler, scheduler, backend):
+                   loras, start_step, sampler, scheduler, backend, num_images=1):
     """ComfyUI API 형식 워크플로를 만든다.
 
     노드 구성은 ComfyUI 공식 템플릿(image_krea2_turbo_t2i.json)과 같다:
@@ -508,8 +510,12 @@ def build_workflow(prompt, negative, width, height, steps, cfg, seed,
               "inputs": {"vae_name": os.path.basename(VAE_FILE)}},
         "5": {"class_type": "CLIPTextEncode",
               "inputs": {"clip": ["2", 0], "text": prompt}},
+        # ⭐ v9: batch_size 가 곧 num_images 다. 공식 sample() 의 num_images 와 같은 것으로,
+        #    한 프롬프트로 여러 장을 한 번에 뽑는다. 시안을 여러 개 뽑아 고를 때 쓴다.
+        #    ⚠️ 공식은 시드가 seed, seed+1 … 로 올라가지만 ComfyUI 배치는 한 시드에서
+        #       배치 차원으로 뽑는다. 결과가 같지 않을 수 있다. 실측으로 확인해야 한다.
         "7": {"class_type": "EmptyLatentImage",
-              "inputs": {"width": width, "height": height, "batch_size": 1}},
+              "inputs": {"width": width, "height": height, "batch_size": num_images}},
         "10": {"class_type": "SaveImage",
                "inputs": {"images": ["9", 0], "filename_prefix": "krea2"}},
     }
@@ -614,7 +620,12 @@ def wait_for_result(prompt_id, proc, timeout=1800):
     raise RuntimeError(f"{timeout}초 안에 생성이 안 끝났다.")
 
 
-def fetch_image(entry):
+def fetch_images(entry):
+    """결과 이미지를 전부 받는다. (v9 — 여러 장 뽑기 때문에 전부로 바꿨다)
+
+    반환: [(바이트, 파일명), ...]
+    """
+    out = []
     for node_out in (entry.get("outputs") or {}).values():
         for img in node_out.get("images") or []:
             q = urllib.parse.urlencode({
@@ -624,13 +635,66 @@ def fetch_image(entry):
             })
             r = requests.get(f"{COMFY_URL}/view?{q}", timeout=120)
             r.raise_for_status()
-            return r.content, img["filename"]
-    raise RuntimeError("결과에 이미지가 없다.")
+            out.append((r.content, img["filename"]))
+    if not out:
+        raise RuntimeError("결과에 이미지가 없다.")
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────
 # 5) 요청 처리
 # ──────────────────────────────────────────────────────────────────────
+
+def save_media(job):
+    """요청에 실려온 사진을 ComfyUI 가 읽는 폴더에 파일로 놓는다. (v9)
+
+    ⭐ 이 함수가 "참조 이미지로 만들기"의 전제조건이다.
+       크레아2 순정 기능 중 스타일 전이는 사진을 넣어야 쓸 수 있는데,
+       사진을 넣을 통로가 없으면 배선을 아무리 잘 그려도 못 쓴다.
+       영상 워커 v3 의 같은 함수를 옮긴 것이다.
+
+    요청 형식:
+      "media": [{"name": "ref.png", "data": "(base64)"}, ...]
+
+    워커와 ComfyUI 가 같은 컨테이너 안에 있으므로 파일로 직접 놓으면 된다.
+    배선(workflow)에서는 LoadImage 에 파일 이름만 적으면 그대로 읽힌다.
+
+    반환: (놓인 파일 이름 목록, 오류메시지)
+    """
+    items = job.get("media")
+    if not items:
+        return [], None
+    if not isinstance(items, list):
+        return None, "media 는 목록이어야 한다."
+
+    os.makedirs(COMFY_INPUT_DIR, exist_ok=True)
+    saved = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            return None, f"media[{i}] 가 잘못됐다: {item!r}"
+        raw_name = str(item.get("name") or "").strip()
+        data = item.get("data")
+        if not raw_name or not data:
+            return None, f"media[{i}] 에 name 또는 data 가 없다."
+
+        # ⚠️ 경로 탈출 방지. "../../etc/passwd" 같은 이름이 와도 파일명만 남긴다.
+        name = os.path.basename(raw_name)
+        if not name or name in (".", ".."):
+            return None, f"media[{i}] 의 name 이 파일 이름이 아니다: {raw_name!r}"
+
+        try:
+            blob = base64.b64decode(data, validate=True)
+        except Exception as e:
+            return None, f"media[{i}]({name}) 의 data 가 base64 가 아니다: {e}"
+
+        path = os.path.join(COMFY_INPUT_DIR, name)
+        with open(path, "wb") as f:
+            f.write(blob)
+        log(f"[media] 저장 {name} ({len(blob)/1048576:.2f} MB) → {path}")
+        saved.append(name)
+
+    return saved, None
+
 
 def resolve_loras(job):
     """요청의 로라 지정을 실제로 걸 목록으로 바꾼다. 반환값은 (목록, 오류메시지).
@@ -739,6 +803,9 @@ def capabilities():
             {"id": "sampler", "label": "샘플러", "type": "text", "default": DEFAULT_SAMPLER},
             {"id": "scheduler", "label": "스케줄러", "type": "text", "default": DEFAULT_SCHEDULER},
             {"id": "seed", "label": "시드", "type": "int", "default": DEFAULT_SEED},
+            {"id": "num_images", "label": "한 번에 뽑을 장수", "type": "int",
+             "default": 1, "min": 1, "max": 8,
+             "note": "시안을 여러 장 뽑아 고를 때. ⚠️ 장수를 늘리면 응답이 커진다"},
             {"id": "stock", "label": "순정으로 뽑기", "type": "switch", "default": False,
              "note": "로라를 전부 끈다. 로라가 실제로 붙었는지 대조하는 기준점"},
             {"id": "lora_start_step", "label": "로라를 몇 스텝부터 걸까",
@@ -759,9 +826,31 @@ def capabilities():
                                    "strength": 0.8}]},
             "why": "크레아2 로라가 1,895개라 카탈로그에 다 넣을 수 없다(약 199KB)",
         },
+        "media": {
+            "how": "media 에 [{name, data(base64)}] 를 실으면 사진을 컨테이너에 파일로 놓는다",
+            "then": "workflow 의 LoadImage 에 그 파일 이름을 적으면 읽힌다",
+            "dir": COMFY_INPUT_DIR,
+            "why": "크레아2 순정 기능 중 '참조 이미지로 만들기(스타일 전이)'의 전제조건",
+        },
         "workflow_passthrough": {
             "how": "workflow 에 ComfyUI API 형식 JSON 을 넣으면 그대로 실행한다",
             "why": "코드를 안 고치고 새 배선을 시험하기 위한 통로",
+            "style_reference": {
+                "상태": "아직 안 해봤다",
+                "필요한 로라": "Comfy-Org/Krea-2 loras/krea2_style_reference.safetensors",
+                "노드": ["LoadImage", "TextEncodeQwenImageEditPlus",
+                       "FluxKontextMultiReferenceLatentMethod", "ModelSamplingFlux"],
+                "⚠️": "공식 템플릿은 int8 본체 기준이다. 우리 GGUF 조합은 미확인",
+            },
+        },
+        "native_features": {
+            "글로 만들기": "된다",
+            "참조 이미지로 만들기(스타일 전이)": "media + workflow 로 시험 가능. 미확인",
+            "여러 장 뽑기": "된다 (num_images)",
+            "mu 1.15": "ComfyUI 가 자동 적용 (supported_models.py shift=1.15)",
+            "무드보드": "불가 — 크레아 웹앱에서만 만든다",
+            "슬라이더(intensity/complexity/movement)": "불가 — 로라가 공개 안 됨",
+            "creativity": "워커 밖 — 프롬프트를 늘리는 단계에서 다룬다",
         },
         "lora_skip_keys": LORA_SKIP_KEYS or None,
         "preloaded": sorted(_lora_ready),
@@ -772,6 +861,12 @@ def generate(job):
     """요청 하나를 처리한다. 이 함수가 몸통의 입구다."""
     if str(job.get("action", "")).lower() == "capabilities":
         return capabilities()
+
+    # ⭐ v9: 사진을 먼저 컨테이너 안에 놓는다.
+    #    workflow 를 통째로 던질 때도 필요하므로 분기 앞에서 처리한다.
+    saved, err = save_media(job)
+    if err:
+        return {"error": err}
 
     # ⭐ v9: 워크플로 통째로 던지기
     raw_wf = job.get("workflow")
@@ -801,6 +896,8 @@ def generate(job):
             "start_step": int(job.get("lora_start_step", DEFAULT_LORA_START_STEP)),
             "stock": bool(job.get("stock")),
             "loras": loras,
+            # ⭐ v9: 한 번에 여러 장. 공식 sample() 의 num_images 와 같은 것
+            "num_images": max(1, min(int(job.get("num_images", 1)), 8)),
         }
         seed = job.get("seed", DEFAULT_SEED)
         p["seed"] = (random.randint(0, 2**31 - 1)
@@ -809,7 +906,7 @@ def generate(job):
         wf = build_workflow(p["prompt"], p["negative"], p["width"], p["height"],
                             p["steps"], p["cfg"], p["seed"], p["loras"],
                             p["start_step"], p["sampler"], p["scheduler"],
-                            MODEL_BACKEND)
+                            MODEL_BACKEND, p["num_images"])
 
     watcher = VramWatcher()
     watcher.start()
@@ -822,11 +919,14 @@ def generate(job):
             log(f"[job] 큐 등록 {prompt_id} — {p['width']}x{p['height']} {p['steps']}스텝 "
                 f"cfg{p['cfg']} seed{p['seed']} backend={MODEL_BACKEND} "
                 f"lora=[{desc}]{' 순정' if p['stock'] else ''} "
-                f"start_step={p['start_step']} sampler={p['sampler']}")
+                f"start_step={p['start_step']} sampler={p['sampler']} "
+                f"장수={p['num_images']}{f' 사진={saved}' if saved else ''}")
         else:
-            log(f"[job] 큐 등록 {prompt_id} — workflow 통째로 받음 (노드 {len(wf)}개)")
+            log(f"[job] 큐 등록 {prompt_id} — workflow 통째로 받음 (노드 {len(wf)}개)"
+                f"{f' 사진={saved}' if saved else ''}")
         entry = wait_for_result(prompt_id, COMFY_PROC)
-        payload, filename = fetch_image(entry)
+        images = fetch_images(entry)
+        payload, filename = images[0]
     except Exception as e:
         # ⚠️ 응답만 돌려보내면 로그에 흔적이 안 남는다. 나중에 추적이 불가능해진다.
         watcher.stop_flag.set()
@@ -841,20 +941,33 @@ def generate(job):
 
     elapsed = time.time() - t0
     result = {
+        # 첫 장. 한 장만 뽑았으면 v8 과 형식이 같다
         "image_base64": base64.b64encode(payload).decode("utf-8"),
         "format": "png",
         "bytes": len(payload),
         "generation_sec": round(elapsed, 1),
         "filename": filename,
+        "media_saved": saved or None,
         "backend": MODEL_BACKEND,
         "model": f"{MODEL_REPO}/{MODEL_FILE}",
         "text_encoder": f"{TE_REPO}/{TE_FILE}",
         "lora_skip_keys": LORA_SKIP_KEYS or None,
     }
+    # ⭐ v9: 여러 장을 뽑았으면 나머지도 담는다.
+    #    ⚠️ 런포드 응답 크기 제한이 있다(/run 10MB, /runsync 20MB, base64 는 1.33배).
+    #       장수를 늘리면 걸릴 수 있다. 그래서 개수와 총 크기를 응답에 같이 담아
+    #       무엇 때문에 큰지 알 수 있게 한다.
+    if len(images) > 1:
+        result["images_base64"] = [
+            base64.b64encode(b).decode("utf-8") for b, _ in images]
+        result["filenames"] = [n for _, n in images]
+        result["images_count"] = len(images)
+        result["total_bytes"] = sum(len(b) for b, _ in images)
+
     if p is not None:
         result.update({
             "width": p["width"], "height": p["height"], "seed": p["seed"],
-            "steps": p["steps"], "cfg": p["cfg"],
+            "steps": p["steps"], "cfg": p["cfg"], "num_images": p["num_images"],
             "sampler": p["sampler"], "scheduler": p["scheduler"],
             "stock": p["stock"],
             # ⭐ 무엇이 실제로 걸렸는지. 로라는 조용히 무시되므로 이게 유일한 확인 수단이다
