@@ -1,0 +1,110 @@
+# 미니맥스 H3 영상+소리 워커 — ComfyUI 런포드 서버리스
+#
+# 모델 가중치는 이 이미지에 넣지 않는다. 워커가 뜰 때 허깅페이스에서 직접 받는다.
+# (다운로드 시간은 런포드가 과금하지 않는다 — 공식 문서
+#  "You aren't billed for worker time while your model is being downloaded.")
+#
+# ⚠️ 런포드 콘솔의 Model(모델 캐싱) 칸은 반드시 비워둔다.
+#    Comfy-Org/MiniMax-H3 저장소에는 양자화 버전이 20개 들어 있어 총 433.2GB 다.
+#    캐시를 켜면 우리가 쓰는 39.6GB 대신 433GB 를 받는다 (공식 문서 Current limitations:
+#    "the system currently downloads all quantization versions").
+#
+# 명세: E:\미니맥스H3_분석\명세_워커h3.html
+# 배선 근거: Comfy-Org 공식 워크플로 템플릿 3종(t2v/i2v/r2v) 을 내려받아
+#            definitions.subgraphs 안의 노드·연결을 전수 판독했다 (2026-08-14)
+
+# ──────────────────────────────────────────────────────────────────────
+# ⚠️ 이 Dockerfile 에 확인문(assert·python -c 검사)을 함부로 덧붙이지 말 것.
+#    크레아2 빌드 실패 4건이 전부 나중에 덧붙인 확인문 하나에서 났다.
+#    정작 워커는 그 확인문이 없을 때 멀쩡히 돌았다.
+# ──────────────────────────────────────────────────────────────────────
+
+# ⭐ LTX·크레아2 와 같은 베이스다. 런포드에서 도는 것이 이미 확인된 조합이다.
+#    ⭐ 그리고 H3 본체(int8_convrot)가 요구하는 조건을 이미 만족한다 —
+#       공식 모델카드: "prefer int8_convrot if you are able to use pytorch with cu130"
+#       이 이미지가 cuda13.0 = cu130 이다.
+FROM pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime
+
+# ⭐ 전부 고정한다. latest·브랜치 추적 금지 (보스 지시 2026-08-04).
+#
+# ComfyUI v0.32.0 — H3 는 코어에 들어있다. 커스텀 노드가 필요 없다.
+#   근거 (깃허브 API 로 직접 조회, 2026-08-14):
+#     PR #15224 "feat: Support MiniMax-H3 (CORE-375)"  병합 2026-08-03 02:28 UTC
+#     v0.29.2  2026-07-31   ⬅ LTX 워커가 쓰는 것. H3 병합 3일 전이라 H3 가 없다
+#     v0.30.0  2026-08-03   ⬅ H3 가 처음 들어간 판 (병합 당일)
+#     v0.32.0  2026-08-11   ⬅ 이것
+#     v0.33.1  2026-08-13   ⬅ 최신이지만 나온 지 하루
+#   ⚠️ v0.32.0 을 고른 것은 "초기 버그 수정이 들어갈 시간은 있으면서 갓 나온 판은
+#      피한다"는 판단이며 근거가 있는 값이 아니다.
+#      24GB 성공 사례는 v0.30.x 에서 나왔다. 문제가 생기면 여기를 v0.30.0 으로 내린다.
+ARG COMFYUI_VERSION=v0.32.0
+
+# ⚠️ 커스텀 노드가 하나도 없다. LTX 와 다른 점이다.
+#    - H3 노드는 ComfyUI 코어에 있다 (MiniMaxH3ImageToVideo / MiniMaxH3ReferenceToVideo)
+#    - 모델이 safetensors 라 city96/ComfyUI-GGUF 가 필요 없다
+#    - 로라는 코어 LoraLoaderModelOnly 로 붙는다
+#    → 빌드가 LTX 보다 단순하고 깨질 자리도 적다.
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_INPUT=1 \
+    HF_XET_HIGH_PERFORMANCE=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    COMFYUI_PORT=8188
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git \
+      ca-certificates \
+      libgl1 \
+      libglib2.0-0 \
+      ffmpeg \
+    && apt-get autoremove -y && apt-get clean -y && rm -rf /var/lib/apt/lists/*
+# ⭐ ffmpeg 는 영상 저장(CreateVideo → SaveVideo)에 필요하다. LTX 와 같다.
+
+# ComfyUI 본체 — 태그로 고정
+RUN git clone --depth 1 --branch ${COMFYUI_VERSION} \
+      https://github.com/Comfy-Org/ComfyUI /comfyui
+
+# ⚠️ transformers / huggingface-hub 를 여기서 못박는다.
+#    ComfyUI 는 상한을 안 걸어놔서 새로 깔면 5.x / 1.x 가 딸려와 시작할 때 죽는다.
+RUN python -m pip install --no-cache-dir --break-system-packages \
+      -r /comfyui/requirements.txt \
+ && python -m pip install --no-cache-dir --break-system-packages \
+      "transformers>=4.50.3,<5" "huggingface-hub<1.0"
+
+# handler 가 쓰는 것
+#   runpod    서버리스 진입점
+#   requests  ComfyUI HTTP API 호출
+#   hf_xet    대용량 다운로드 가속 (39.6GB 를 매번 받으므로 중요하다)
+RUN python -m pip install --no-cache-dir --break-system-packages \
+      runpod requests hf_xet hf_transfer
+
+# 모델이 들어갈 폴더를 미리 만든다. 워커가 여기에 받아 놓는다.
+#   diffusion_models  본체            (코어 UNETLoader)
+#   text_encoders     글 이해기        (코어 CLIPLoader, type=minimax)
+#   vae               영상 VAE + 소리 VAE  (코어 VAELoader ×2)
+#   loras             로라
+#
+# ⚠️ LTX 와 다른 점 — LTX 는 소리 VAE 를 models/checkpoints 에 놓아야 했다
+#    (코어 LTXVAudioVAELoader 가 거기를 봐서). H3 는 둘 다 models/vae 다.
+#    Comfy-Org 공식 모델카드와 공식 워크플로 양쪽에서 확인했다.
+RUN mkdir -p /comfyui/models/diffusion_models \
+             /comfyui/models/text_encoders \
+             /comfyui/models/vae \
+             /comfyui/models/loras
+
+# ⭐ ComfyUI 를 실제로 한 번 띄워본다(CPU). 노드 그래프를 전부 import 하므로
+#    의존성이 어긋났으면 여기서 잡힌다.
+#    ⚠️ 크레아2 v4·LTX 에서 통과가 확인된 방식이다. 여기에 뭘 더 붙이지 말 것.
+RUN cd /comfyui && timeout 900 python main.py --quick-test-for-ci --cpu
+
+COPY h3_core.py /h3_core.py
+COPY handler_h3.py /handler_h3.py
+
+# ⭐ 문법 검사.
+#    ⚠️ LTX·크레아2 Dockerfile 에는 "이 PC 에는 파이썬이 없어서 로컬에서 못 돌린다" 고
+#       적혀 있는데, 2026-08-14 확인 결과 이 PC 에 파이썬 3.13.15 가 있다.
+#       h3_core.py 는 로컬에서 py -m py_compile 로 미리 걸러낸 뒤 올렸다.
+#    그래도 이 단계를 남기는 이유는 컨테이너 안 파이썬 버전에서 한 번 더 걸러내기 위해서다.
+RUN python -m py_compile /h3_core.py /handler_h3.py && echo "handler 문법 OK"
+
+CMD ["python", "-u", "/handler_h3.py"]

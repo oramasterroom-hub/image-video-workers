@@ -1,0 +1,153 @@
+name: Build MiniMax H3 ComfyUI RunPod worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.h3"
+      - "h3_core.py"
+      - "handler_h3.py"
+      - ".github/workflows/docker-build-h3.yml"
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: h3-runpod
+  # 런포드는 이름표가 같으면 자기 기계에 캐시해둔 옛 이미지를 계속 쓴다.
+  # 코드나 Dockerfile 을 고칠 때마다 이름표를 올린다.
+  #
+  # v1 (2026-08-14): 최초.
+  #
+  #   ⭐ 무엇을 하는 워커인가
+  #      미니맥스 H3 로 영상과 소리를 한 번에 만든다. LTX 2.3 도 소리를 내지만,
+  #      H3 는 말소리·효과음·음악을 한 번의 계산으로 영상과 같이 만든다(32kHz 스테레오).
+  #
+  #   구성 — ComfyUI v0.32.0
+  #          베이스 pytorch/pytorch:2.13.0-cuda13.0-cudnn9-runtime (크레아2·LTX 와 동일)
+  #          ⭐ 커스텀 노드 0개 — LTX(2개)·크레아2 와 다른 점이다.
+  #             H3 노드가 ComfyUI 코어에 있고, 모델이 safetensors 라 GGUF 로더도 필요 없다.
+  #          ffmpeg (영상 저장에 필요)
+  #
+  #   ⭐ ComfyUI 버전을 v0.32.0 으로 정한 근거 (깃허브 API 로 직접 조회, 2026-08-14)
+  #      PR #15224 "feat: Support MiniMax-H3 (CORE-375)" 병합 2026-08-03 02:28 UTC
+  #        v0.29.2  2026-07-31  ⬅ LTX 워커가 쓰는 것. H3 병합 3일 전이라 H3 가 없다
+  #        v0.30.0  2026-08-03  ⬅ H3 가 처음 들어간 판 (병합 당일)
+  #        v0.32.0  2026-08-11  ⬅ 이것
+  #        v0.33.1  2026-08-13  ⬅ 최신이지만 나온 지 하루
+  #      ⚠️ v0.32.0 선택은 "초기 버그 수정이 들어갈 시간은 있으면서 갓 나온 판은 피한다"는
+  #         판단이며 근거 있는 값이 아니다. 24GB 성공 사례는 v0.30.x 에서 나왔다.
+  #         문제가 생기면 Dockerfile.h3 의 COMFYUI_VERSION 을 v0.30.0 으로 내린다.
+  #
+  #   모델 4개 (39.6GB) — Comfy-Org/MiniMax-H3, 워커가 뜰 때 받는다
+  #        본체      minimax_h3_fl2va_pruned_int8_convrot   19.5GB → diffusion_models
+  #        글 이해기 qwen3vl_32b_minimax_h3_nvfp4_awq       14.6GB → text_encoders
+  #        영상 VAE  minimax_h3_video_vae_fp16               4.9GB → vae
+  #        소리 VAE  minimax_h3_audio_vae_fp32               0.6GB → vae
+  #      ⚠️ LTX 는 소리 VAE 를 models/checkpoints 에 놓아야 했다(LTXVAudioVAELoader 가
+  #         거기를 봐서). H3 는 둘 다 models/vae 다. 공식 모델카드·워크플로로 확인했다.
+  #      ⭐ pruned 는 품질 손실이 없다 — 추론에 안 쓰는 13B 를 뺀 것이라고 공식이 밝혔다.
+  #      ⭐ int8_convrot 은 공식 권고다("prefer int8_convrot if you are able to use
+  #         pytorch with cu130"). 우리 베이스가 cuda13.0 이라 조건을 이미 만족한다.
+  #
+  #   ⚠️ 런포드 콘솔의 Model(캐싱) 칸은 반드시 비워둔다.
+  #      공식 제약: "If a Hugging Face repository contains multiple quantization versions
+  #      of a model, the system currently downloads all quantization versions."
+  #      이 저장소는 양자화 버전 20개 총 433.2GB 다. 켜면 39.6GB 대신 433GB 를 받는다.
+  #
+  #   ⭐ 24GB 안에 들어가게 하는 실행 플래그 (h3_core.py memory_args)
+  #        --disable-pinned-memory   ComfyUI 가 리눅스에서 시스템 RAM 의 90% 를
+  #                                  page-lock 하는 것을 끈다. 잠긴 페이지는 커널이
+  #                                  회수할 수 없어 메모리가 빠듯하면 프로세스를 SIGKILL 한다.
+  #                                  공개 실측(tonyd2wild/minimax-h3-local): 같은 조건에서
+  #                                    기본값                  호스트 RAM 29,866MB → 커널이 죽임
+  #                                    --disable-pinned-memory 호스트 RAM  7,508MB → 15초 영상 성공
+  #        --fp16-intermediates      노드 사이 텐서를 절반 크기로
+  #      ⚠️ 둘 다 환경변수로 끌 수 있다(DISABLE_PINNED_MEMORY / FP16_INTERMEDIATES).
+  #         남의 실측이라 문제가 생기면 재빌드 없이 되돌린다.
+  #
+  #   배선 — Comfy-Org 공식 워크플로 템플릿 3종(t2v/i2v/r2v)의 definitions.subgraphs
+  #          안 노드·연결 30개를 전수 판독하고, 그 위에 ComfyUI v0.32.0 소스에서
+  #          노드 16종의 입력 이름을 전부 대조했다. 지어낸 이름이 하나도 없다.
+  #      ⚠️ 가장 틀리기 쉬운 자리 — 본체(또는 로라 사슬의 끝)는 BasicGuider 와
+  #         BasicScheduler 양쪽에 똑같이 물린다. 한쪽만 이으면 로라가 절반만 먹는다.
+  #      ⚠️ MiniMaxH3ImageToVideo 는 vae 를 하나만(영상) 받는다. 소리 VAE 는
+  #         VAEDecodeAudio 에만 물린다. 참조모드 노드는 audio_vae 를 하나 더 받는다.
+  #
+  #   로라 — 카탈로그 이름(LORA_CATALOG)과 저장소 주소 직접 지정을 둘 다 받는다.
+  #      ⭐ 주소 직접 지정은 LTX 에는 없고 크레아2 에는 있는 기능이다. H3 는 크레아2 를 따랐다.
+  #         덕분에 카탈로그에 없는 로라도 재빌드·워커 재시작 없이 바로 시험할 수 있다.
+  #      ⚠️ 로라는 안 붙어도 ComfyUI 가 오류를 안 낸다. 응답의 loras_applied 가
+  #         붙었는지 확인할 유일한 수단이다.
+  #      ⚠️ 터보 로라로 스텝을 4 까지 내리면 소리가 망가진다는 보고가 여럿이다(6~8 이 하한).
+  #         제작자 권장 시그마 시프트(영상 12 / 소리 6)는 SIGMA_SHIFT 로 켠다.
+  #
+  #   ⚠️ 확인문을 일절 덧붙이지 않았다. 크레아2 빌드 실패 4건이 전부 확인문에서 났다.
+  #      ComfyUI CPU 기동 테스트와 py_compile 만 남겼다.
+  #
+  #   ⭐ 이번엔 로컬에서 먼저 걸렀다 — 이 PC 에 파이썬 3.13.15 가 있다(2026-08-14 확인).
+  #      py_compile 로 문법을, 스텁 모듈을 끼워 워크플로 생성까지 로컬에서 돌려봤다.
+  #      LTX·크레아2 Dockerfile 의 "이 PC 엔 파이썬이 없다"는 주석은 사실이 아니었다.
+  #
+  #   ⚠️ 아직 한 번도 안 돌려봤다. VRAM·속도·화질·소리 품질 전부 미측정이다.
+  #      24GB 에 들어가는지는 6단계 첫 생성에서 갈린다.
+  IMAGE_TAG: v1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ComfyUI + torch 가 커서 러너 디스크가 모자랄 수 있다.
+      - name: 디스크 공간 확보
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 빌드 후 ghcr.io 로 푸시
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.h3
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          provenance: false
+
+      - name: 이미지 크기 재기
+        run: |
+          IMG=ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          docker pull "$IMG"
+          echo "=============================================="
+          # ⚠️ 고 템플릿에는 div 함수가 없다. 셸에서 나눈다
+          #    (크레아2 v4 빌드에서 이 줄 때문에 스텝이 실패했다. 이미지는 이미 푸시된 뒤였다)
+          BYTES=$(docker image inspect "$IMG" --format '{{.Size}}')
+          echo "압축 해제 크기: $BYTES 바이트 ($((BYTES / 1048576)) MB)"
+          echo "=============================================="
+
+  # 같은 태그로 덮어쓰면 옛 이미지가 태그 없이 남아 매번 쌓인다.
+  cleanup:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: 태그 없는 옛 이미지 삭제
+        uses: actions/delete-package-versions@v5
+        continue-on-error: true
+        with:
+          package-name: h3-runpod
+          package-type: container
+          min-versions-to-keep: 1
+          delete-only-untagged-versions: true
